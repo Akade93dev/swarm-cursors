@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Interop;
+using System.Windows.Threading;
 using Microsoft.Web.WebView2.Core;
 using Swarm.Core.Diagnostics;
 using Swarm.Core.Semantics;
@@ -16,8 +17,8 @@ public partial class MainWindow : Window
     private TaskCompletionSource? _rebuildReady;
     private readonly DesktopTaskService _tasks;
     private readonly DesktopIpcServer _ipcServer;
+    private readonly DispatcherTimer _pointerPump;
     private nint _handle;
-    private nint _returnFocusWindow;
     private nint _keyboardHook;
     private NativeMethods.LowLevelKeyboardProc? _keyboardProc;
     private bool _transition;
@@ -25,6 +26,14 @@ public partial class MainWindow : Window
     private bool _closed;
     private OverlayMode _overlayMode;
     private string? _overlayKey;
+    private double _overlayDpi = 1;
+    private bool _pointerPosted;
+    private int _pointerX;
+    private int _pointerY;
+    private Rect _hudRect;
+    private bool _hudRectValid;
+    private NativeMethods.LowLevelKeyboardProc? _mouseProc;
+    private nint _mouseHook;
     private string? _hotkeyWarning;
 
     private enum OverlayMode
@@ -39,6 +48,8 @@ public partial class MainWindow : Window
         InitializeComponent();
         _tasks = new DesktopTaskService(this);
         _ipcServer = new DesktopIpcServer(HandleIpc);
+        _pointerPump = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(33) };
+        _pointerPump.Tick += (_, _) => SamplePointer();
         SourceInitialized += OnSourceInitialized;
         Loaded += OnLoaded;
         Closed += OnClosed;
@@ -104,7 +115,7 @@ public partial class MainWindow : Window
         // 仅测试用：置 1 时允许截图工具拍到覆盖层，用于验证首帧是否空白。
         var capturable = Environment.GetEnvironmentVariable("SWARM_CAPTURE_OVERLAY") == "1";
         NativeMethods.SetWindowDisplayAffinity(_handle, capturable ? 0u : 0x11u);
-        SetClickThrough(true);
+        EnsureClickThrough();
         const uint altShiftNoRepeat = 0x0001 | 0x0004 | 0x4000;
         var unavailable = new List<string>();
         if (!NativeMethods.RegisterHotKey(_handle, 1, altShiftNoRepeat, 0x53)) unavailable.Add("Alt+Shift+S（重建）");
@@ -119,6 +130,9 @@ public partial class MainWindow : Window
         }
         _keyboardProc = KeyboardHook;
         _keyboardHook = NativeMethods.SetWindowsHookEx(NativeMethods.WhKeyboardLl, _keyboardProc, NativeMethods.GetModuleHandle(null), 0);
+        _mouseProc = MouseHook;
+        _mouseHook = NativeMethods.SetWindowsHookEx(NativeMethods.WhMouseLl, _mouseProc, NativeMethods.GetModuleHandle(null), 0);
+        if (_mouseHook == 0) FileLog.Write("desktop", "mouse hook unavailable: 控制条点击将不可用");
     }
 
     private IntPtr WindowMessage(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -141,8 +155,8 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// 低层键盘钩子：只有当目标窗口（或重建覆盖层自身）在前台时才消费 Esc，
-    /// 其它程序的 Esc 原样放行；全局急停由 Ctrl+Alt+Shift+Esc 热键负责。
+    /// 低层键盘钩子：只有目标窗口在前台时才消费 Esc，其它程序的 Esc 原样放行；
+    /// 全局急停由 Ctrl+Alt+Shift+Esc 热键负责。覆盖层永不激活，因此不再参与前台判断。
     /// </summary>
     private nint KeyboardHook(int code, nint wParam, nint lParam)
     {
@@ -158,10 +172,26 @@ public partial class MainWindow : Window
         return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
     }
 
-    private bool ShouldConsumeEscape()
+    private bool ShouldConsumeEscape() => _tasks.TargetOwnsForeground;
+
+    /// <summary>
+    /// 低层鼠标钩子：覆盖层常开点击穿透，页面收不到真实鼠标事件，所以底部控制条由这里接管——
+    /// 命中控制条时吞掉这次按下/抬起，转成 hud-input 让渲染层派发 DOM 事件；
+    /// 其余位置一律放行，真实点击继续落到下面的窗口。
+    /// </summary>
+    private nint MouseHook(int code, nint wParam, nint lParam)
     {
-        if (_tasks.TargetOwnsForeground) return true;
-        return _overlayMode == OverlayMode.Rebuild && NativeMethods.GetForegroundWindow() == _handle;
+        if (code >= 0 && _hudRectValid && _overlayMode != OverlayMode.None && IsVisible)
+        {
+            var message = (int)wParam;
+            if ((message == NativeMethods.WmLButtonDown || message == NativeMethods.WmLButtonUp)
+                && TryCssPointer(out var x, out var y) && _hudRect.Contains(x, y))
+            {
+                PostMessage(new { type = "hud-input", action = message == NativeMethods.WmLButtonDown ? "down" : "up", x, y });
+                return 1;
+            }
+        }
+        return NativeMethods.CallNextHookEx(_mouseHook, code, wParam, lParam);
     }
 
     private async Task ToggleRebuild(bool semantic)
@@ -238,7 +268,7 @@ public partial class MainWindow : Window
     {
         _overlayMode = OverlayMode.Task;
         ApplyGeometry(monitor, dpi);
-        SetClickThrough(true);
+        EnsureClickThrough();
     }
 
     public void HideTaskOverlay()
@@ -246,9 +276,8 @@ public partial class MainWindow : Window
         if (_overlayMode != OverlayMode.Task) return;
         if (_active)
         {
-            // 重建视图仍在，任务结束后把交互权还给重建覆盖层。
+            // 重建视图仍在，任务结束后回到重建态的可见性（点击穿透始终不变）。
             _overlayMode = OverlayMode.Rebuild;
-            SetClickThrough(false);
             return;
         }
         _overlayMode = OverlayMode.None;
@@ -265,7 +294,6 @@ public partial class MainWindow : Window
         {
             // 任务仍在进行：保留覆盖层承载 ops 面板，继续点击穿透。
             _overlayMode = OverlayMode.Task;
-            SetClickThrough(true);
             return;
         }
         _overlayMode = OverlayMode.None;
@@ -287,18 +315,11 @@ public partial class MainWindow : Window
     private void ShowRebuild(CapturedScreen capture)
     {
         _active = true;
-        _returnFocusWindow = capture.SourceWindow;
-        if (_tasks.IsActive)
-        {
-            // 任务期间的重建只作可视化：不抢前台、不接管点击，避免暂停用户对真实窗口的操作。
-            ApplyGeometry(capture.Monitor, capture.DpiScale);
-            SetClickThrough(true);
-            return;
-        }
-        _overlayMode = OverlayMode.Rebuild;
+        // 覆盖层只负责显示：始终点击穿透、从不激活，用户的真实窗口保持前台和输入权。
+        _overlayMode = _tasks.IsActive ? OverlayMode.Task : OverlayMode.Rebuild;
+        _hudRectValid = false;
         ApplyGeometry(capture.Monitor, capture.DpiScale);
-        SetClickThrough(false);
-        Activate();
+        EnsureClickThrough();
     }
 
     /// <summary>等渲染层挂载完图块再现出覆盖层，避免首帧只看到空白背景。</summary>
@@ -316,17 +337,110 @@ public partial class MainWindow : Window
     /// 用物理像素定位覆盖层，避免混合 DPI 多显示器下 WPF 的 DIP 换算错位；
     /// 同一显示器与 DPI 不重复应用，防止每次 observe 重置窗口并触发重建重启。
     /// </summary>
-    private void ApplyGeometry(RectInt monitor, double dpi)
+    private void ApplyGeometry(RectInt monitor, double fallbackDpi)
     {
         if (_handle == 0) return;
-        var key = $"{monitor.X},{monitor.Y},{monitor.Width},{monitor.Height},{dpi:0.###}";
+        // 覆盖层只铺满工作区：盖住任务栏会让它在重建期间既看不见也点不到。
+        var work = MonitorWorkArea(monitor);
+        // 覆盖层的 CSS 视口按自己所在显示器的 DPI 换算；目标窗口若 DPI 不感知（GetDpiForWindow 返回 96），
+        // 用它的 DPI 算指针会按错误比例放大，离屏幕原点越远偏移越大。
+        var dpi = MonitorDpi(monitor, fallbackDpi);
+        var key = $"{work.X},{work.Y},{work.Width},{work.Height},{dpi:0.###}";
         if (_overlayKey == key && IsVisible) return;
         _overlayKey = key;
-        Width = monitor.Width / dpi;
-        Height = monitor.Height / dpi;
+        _overlayDpi = dpi;
+        _pointerPosted = false;
+        Width = work.Width / dpi;
+        Height = work.Height / dpi;
         Opacity = 1;
         if (!IsVisible) Show();
-        NativeMethods.SetWindowPos(_handle, -1, monitor.X, monitor.Y, monitor.Width, monitor.Height, NativeMethods.SwpNoActivate | 0x0040);
+        NativeMethods.SetWindowPos(_handle, -1, work.X, work.Y, work.Width, work.Height, NativeMethods.SwpNoActivate | 0x0040);
+        _pointerPump.Start();
+        FileLog.Write("desktop", $"overlay work={work.X},{work.Y} {work.Width}x{work.Height} dpi={dpi:0.###} css={Width:0}x{Height:0}");
+    }
+
+    /// <summary>取显示器工作区（不含任务栏）；读取失败时退回整个显示器。</summary>
+    private static RectInt MonitorWorkArea(RectInt monitor)
+    {
+        var rect = new NativeMethods.Win32Rect
+        {
+            Left = monitor.X,
+            Top = monitor.Y,
+            Right = monitor.X + monitor.Width,
+            Bottom = monitor.Y + monitor.Height,
+        };
+        var handle = NativeMethods.MonitorFromRect(ref rect, 2);
+        if (handle == 0) return monitor;
+        var info = new NativeMethods.MonitorInfo { Size = Marshal.SizeOf<NativeMethods.MonitorInfo>() };
+        if (!NativeMethods.GetMonitorInfo(handle, ref info)) return monitor;
+        var work = info.WorkArea;
+        if (work.Right <= work.Left || work.Bottom <= work.Top) return monitor;
+        return new RectInt(work.Left, work.Top, work.Right - work.Left, work.Bottom - work.Top);
+    }
+
+    private static double MonitorDpi(RectInt monitor, double fallback)
+    {
+        var rect = new NativeMethods.Win32Rect
+        {
+            Left = monitor.X,
+            Top = monitor.Y,
+            Right = monitor.X + monitor.Width,
+            Bottom = monitor.Y + monitor.Height,
+        };
+        var handle = NativeMethods.MonitorFromRect(ref rect, 2);
+        if (handle != 0 && NativeMethods.GetDpiForMonitor(handle, 0, out var dpiX, out _) == 0 && dpiX > 0)
+            return dpiX / 96.0;
+        return fallback > 0 ? fallback : 1;
+    }
+
+    /// <summary>
+    /// 点击穿透窗口收不到任何鼠标消息，指针位置只能由宿主采样后推给渲染层：
+    /// 30Hz 轮询，只在位置变化时发一条；指针静止或离开本屏时完全不产生消息。
+    /// 同一份采样顺带决定底部控制条是否临时接收鼠标。
+    /// </summary>
+    private void SamplePointer()
+    {
+        if (_handle == 0 || _overlayMode == OverlayMode.None || !IsVisible) return;
+        if (!TryCssPointer(out var x, out var y)) return;
+        if (_pointerPosted && x == _pointerX && y == _pointerY) return;
+        _pointerPosted = true;
+        _pointerX = x;
+        _pointerY = y;
+        PostMessage(new { type = "pointer", x, y });
+    }
+
+    /// <summary>把物理屏幕坐标换算成覆盖层里的 CSS 像素；指针不在覆盖层内时返回 false。</summary>
+    private bool TryCssPointer(out int x, out int y)
+    {
+        x = 0;
+        y = 0;
+        if (!NativeMethods.GetCursorPos(out var point)) return false;
+        if (!NativeMethods.ScreenToClient(_handle, ref point)) return false;
+        var dpi = _overlayDpi > 0 ? _overlayDpi : 1;
+        x = (int)Math.Round(point.X / dpi);
+        y = (int)Math.Round(point.Y / dpi);
+        return x >= 0 && y >= 0 && x < Width && y < Height;
+    }
+
+    /// <summary>渲染层上报底部控制条的可交互区域（CSS 像素），布局变化时才上报一次。</summary>
+    private void ReadHudRect(JsonElement root)
+    {
+        var valid = false;
+        var rect = default(Rect);
+        if (root.TryGetProperty("rect", out var value) && value.ValueKind == JsonValueKind.Object
+            && value.TryGetProperty("x", out var x) && x.TryGetDouble(out var rx)
+            && value.TryGetProperty("y", out var y) && y.TryGetDouble(out var ry)
+            && value.TryGetProperty("w", out var w) && w.TryGetDouble(out var rw)
+            && value.TryGetProperty("h", out var h) && h.TryGetDouble(out var rh)
+            && rw > 0 && rh > 0)
+        {
+            rect = new Rect(rx, ry, rw, rh);
+            valid = true;
+        }
+        if (valid == _hudRectValid && (!valid || rect == _hudRect)) return;
+        _hudRect = rect;
+        _hudRectValid = valid;
+        FileLog.Write("desktop", valid ? $"hud rect={rect.X:0},{rect.Y:0} {rect.Width:0}x{rect.Height:0}" : "hud rect=none");
     }
 
     private void StopOverlay()
@@ -344,26 +458,28 @@ public partial class MainWindow : Window
         _active = false;
         _overlayMode = OverlayMode.None;
         _overlayKey = null;
+        _pointerPump.Stop();
+        _pointerPosted = false;
+        _hudRectValid = false;
         Opacity = 0;
         Left = -10000;
         Top = -10000;
         Width = 1;
         Height = 1;
         if (_handle != 0) NativeMethods.SetWindowPos(_handle, 0, -10000, -10000, 1, 1, NativeMethods.SwpNoActivate);
-        SetClickThrough(true);
-        var returnFocus = _returnFocusWindow;
-        _returnFocusWindow = 0;
-        if (NativeMethods.GetForegroundWindow() == _handle && NativeMethods.IsWindow(returnFocus))
-            WindowLocator.Activate(returnFocus);
+        EnsureClickThrough();
     }
 
-    private void SetClickThrough(bool clickThrough)
+    /// <summary>
+    /// 覆盖层永不接收鼠标、永不激活：所有真实交互都留给它下面那个窗口。
+    /// 底部控制条的点击由鼠标钩子单独接管（见 <see cref="MouseHook"/>）。
+    /// </summary>
+    private void EnsureClickThrough()
     {
         if (_handle == 0) return;
         var style = NativeMethods.GetWindowLong32(_handle, -20);
-        style |= NativeMethods.WsExToolWindow | NativeMethods.WsExNoActivate;
-        style = clickThrough ? style | NativeMethods.WsExTransparent : style & ~NativeMethods.WsExTransparent;
-        NativeMethods.SetWindowLong32(_handle, -20, style);
+        var next = style | NativeMethods.WsExToolWindow | NativeMethods.WsExNoActivate | NativeMethods.WsExTransparent;
+        if (next != style) NativeMethods.SetWindowLong32(_handle, -20, next);
         NativeMethods.SetWindowPos(_handle, 0, 0, 0, 0, 0, NativeMethods.SwpNoMove | NativeMethods.SwpNoSize | NativeMethods.SwpNoActivate | NativeMethods.SwpFrameChanged);
     }
 
@@ -390,6 +506,9 @@ public partial class MainWindow : Window
                     break;
                 case "escape":
                     StopOverlay();
+                    break;
+                case "hud-rect":
+                    ReadHudRect(root);
                     break;
                 case "renderer-error":
                     var error = root.TryGetProperty("error", out var detail) ? detail.GetString() : "未知渲染错误";
@@ -427,6 +546,7 @@ public partial class MainWindow : Window
     private async void OnClosed(object? sender, EventArgs e)
     {
         _closed = true;
+        _pointerPump.Stop();
         _tasks.StopLocal();
         NativeMethods.UnregisterHotKey(_handle, 1);
         NativeMethods.UnregisterHotKey(_handle, 2);
@@ -435,6 +555,11 @@ public partial class MainWindow : Window
         {
             NativeMethods.UnhookWindowsHookEx(_keyboardHook);
             _keyboardHook = 0;
+        }
+        if (_mouseHook != 0)
+        {
+            NativeMethods.UnhookWindowsHookEx(_mouseHook);
+            _mouseHook = 0;
         }
         if (_handle != 0) NativeMethods.SetWindowDisplayAffinity(_handle, 0);
         await _ipcServer.StopAsync();

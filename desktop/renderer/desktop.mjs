@@ -15,6 +15,12 @@ let statusTimer = 0;
 let opsState = null;
 let opsEl = null;
 let opsHideTimer = 0;
+// 点击穿透窗口收不到 pointermove，指针位置由宿主采样后经 {type:"pointer"} 推送。
+let pointer = null;
+let hudSignature = "";
+const FRAME_MS = 1000 / 30;
+const REST_AFTER = 2000;
+const REST_RAMP = 0.5;
 const OPS_MARK = { pending: "·", running: "◌", succeeded: "✓", failed: "✕", canceled: "⊘" };
 
 function status(text, duration = 2200) {
@@ -53,7 +59,58 @@ function stopRebuild(notify = false) {
   cancelAnimationFrame(app.raf);
   if (app.sound) app.sound.close(0.1);
   app.view.host.remove();
+  reportHud();
   if (notify) post({ type: "closed" });
+}
+
+// 覆盖层默认整体点击穿透，宿主需要知道底部控制条的实际矩形，才能在指针压上去时
+// 临时关掉穿透。布局变化才上报一次，避免每次指针移动都发消息。
+function hudRect() {
+  if (!current) return null;
+  const view = current.view;
+  let left = Infinity;
+  let top = Infinity;
+  let right = -Infinity;
+  let bottom = -Infinity;
+  for (const el of [view.hud, view.unhideBtn]) {
+    if (!el) continue;
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.pointerEvents === "none" || Number(style.opacity) < 0.01) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) continue;
+    left = Math.min(left, rect.left);
+    top = Math.min(top, rect.top);
+    right = Math.max(right, rect.right);
+    bottom = Math.max(bottom, rect.bottom);
+  }
+  if (!(right > left && bottom > top)) return null;
+  const pad = 4;
+  return {
+    x: Math.round(Math.max(0, left - pad)),
+    y: Math.round(Math.max(0, top - pad)),
+    w: Math.round(right - left + pad * 2),
+    h: Math.round(bottom - top + pad * 2),
+  };
+}
+
+function reportHud() {
+  const rect = hudRect();
+  const signature = rect ? `${rect.x},${rect.y},${rect.w},${rect.h}` : "";
+  if (signature === hudSignature) return;
+  hudSignature = signature;
+  post({ type: "hud-rect", rect });
+}
+
+// 桌面模式没有真实 pointermove，“Show controls”药丸要跟着宿主推来的指针走。
+function updatePill(app) {
+  const view = app.view;
+  if (!view.hud.classList.contains("hidden")) return;
+  const nearBottom = Boolean(pointer && pointer.y >= innerHeight - 44);
+  if (!nearBottom) app.pillArmed = true;
+  const visible = nearBottom && app.pillArmed;
+  if (view.unhideBtn.classList.contains("visible") === visible) return;
+  view.unhideBtn.classList.toggle("visible", visible);
+  reportHud();
 }
 
 function bindRebuild(app) {
@@ -76,9 +133,17 @@ function bindRebuild(app) {
     app.sound.setOn(!app.sound.on);
     button("sound").classList.toggle("off", !app.sound.on);
   });
-  button("hide").addEventListener("click", () => view.hud.classList.add("hidden"));
-  view.unhideBtn.addEventListener("click", () => view.hud.classList.remove("hidden"));
-  view.host.addEventListener("pointermove", (event) => { engine.mouse = { x: event.clientX, y: event.clientY }; }, { passive: true });
+  button("hide").addEventListener("click", () => {
+    view.hud.classList.add("hidden");
+    // 指针还停在底部条上时先别弹药丸，否则它会立刻挡在鼠标下面。
+    app.pillArmed = !(pointer && pointer.y >= innerHeight - 44);
+    reportHud();
+  });
+  view.unhideBtn.addEventListener("click", () => {
+    view.hud.classList.remove("hidden");
+    view.unhideBtn.classList.remove("visible");
+    reportHud();
+  });
 }
 
 function startRebuild(payload) {
@@ -92,12 +157,15 @@ function startRebuild(payload) {
   const sound = new Sound();
   sound.init();
   engine.sfx = sound;
-  current = { view, engine, sound, raf: 0, last: performance.now(), speeds: [1, 2, 3], speedIndex: 0 };
+  const now = performance.now();
+  current = { view, engine, sound, raf: 0, last: now, lastRender: 0, activeAt: now, rest: 0, pillArmed: true, speeds: [1, 2, 3], speedIndex: 0 };
   view.intro.style.display = "none";
   view.mount(model);
   engine.setModel(model);
+  if (pointer) engine.mouse = pointer;
   view.bg.classList.add("on");
   view.hud.classList.add("on");
+  reportHud();
   bindRebuild(current);
   engine.onComplete = () => {
     view.status.textContent = `已由 ${engine.cursors.filter((cursor) => cursor.worked).length + engine.retired} 个光标重建`;
@@ -105,17 +173,45 @@ function startRebuild(payload) {
     post({ type: "complete" });
   };
   engine.start();
-  const frame = (now) => {
-    if (!current || current.view !== view) return;
-    const dt = Math.min(0.05, (now - current.last) / 1000);
-    current.last = now;
-    engine.step(dt);
-    view.render(engine);
-    current.raf = requestAnimationFrame(frame);
-  };
-  current.raf = requestAnimationFrame(frame);
+  scheduleFrame(current);
   lastSize = `${innerWidth}x${innerHeight}`;
   post({ type: "rebuild-ready" });
+}
+
+// 30Hz 上限 + 空闲即停：群集安顿后指针静止 2s，缓停帧循环；收到 pointer 或重建事件再唤醒。
+function scheduleFrame(app) {
+  if (!app.raf) app.raf = requestAnimationFrame((now) => frame(app, now));
+}
+
+function frame(app, now) {
+  app.raf = 0;
+  if (!current || current !== app || document.hidden) return;
+  if (now - app.lastRender < FRAME_MS - 2) {
+    scheduleFrame(app);
+    return;
+  }
+  const dt = Math.min(0.05, (now - app.last) / 1000);
+  app.last = now;
+  app.lastRender = now;
+  const engine = app.engine;
+  // 没有可推进的工作（重建完成或剩余任务都被前沿挡住）且指针静止，缓停帧循环。
+  const quiet = engine.flocking || (engine.started && engine.backlog() === 0 && !engine.cursors.some((c) => c.task));
+  if (quiet && now - app.activeAt > REST_AFTER) {
+    app.rest = Math.min(1, app.rest + dt / REST_RAMP);
+    if (app.rest >= 1) return;
+  } else if (app.rest) {
+    app.rest = 0;
+  }
+  engine.step(dt * (1 - app.rest));
+  app.view.render(engine);
+  scheduleFrame(app);
+}
+
+function wake(app) {
+  if (!app || current !== app) return;
+  app.activeAt = performance.now();
+  app.rest = 0;
+  scheduleFrame(app);
 }
 
 function ensureActionLayer() {
@@ -263,6 +359,23 @@ async function handle(message) {
   switch (message.type) {
     case "rebuild": startRebuild(message.payload); break;
     case "rebuild-stop": stopRebuild(false); break;
+    case "pointer":
+      pointer = { x: Number(message.x) || 0, y: Number(message.y) || 0 };
+      if (current) {
+        current.engine.mouse = pointer;
+        wake(current);
+        updatePill(current);
+      }
+      break;
+    case "hud-input": {
+      // 覆盖层是点击穿透的，页面收不到真实鼠标；宿主钩子吞下控制条上的点击后在这里补一次 DOM click。
+      if (message.action !== "up" || !current) break;
+      const x = Number(message.x) || 0;
+      const y = Number(message.y) || 0;
+      const target = current.view.root.elementFromPoint(x, y);
+      if (target) target.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
+      break;
+    }
     case "action-prepare": prepareAction(message.action); break;
     case "action-result": finishAction(message.result); break;
     case "action-clear": case "clear-actions": clearActions(); status(""); break;
@@ -278,6 +391,12 @@ if (bridge()) bridge().addEventListener("message", (event) => handle(event.data)
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") post({ type: "escape" });
   if (event.key.toLowerCase() === "h" && current) current.view.hud.classList.toggle("hidden");
+});
+// 合上/最小化时 RAF 不再被调度，恢复可见后必须显式重新起帧。
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden || !current) return;
+  current.last = performance.now();
+  wake(current);
 });
 let resizeTimer = 0;
 let lastSize = "";

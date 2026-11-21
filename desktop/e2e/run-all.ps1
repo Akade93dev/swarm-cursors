@@ -45,7 +45,7 @@ finally {
     Pop-Location
 }
 
-$suites = @('p0-routing.ps1', 'p1-pixels.ps1', 'edge-pixels.ps1', 'type-focus.ps1')
+$suites = @('p0-routing.ps1', 'p1-pixels.ps1', 'p2-overlay.ps1', 'edge-pixels.ps1', 'type-focus.ps1')
 $failed = @()
 foreach ($suite in $suites) {
     Write-Output "== $suite =="

@@ -30,6 +30,12 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     internal static extern nint MonitorFromWindow(nint hWnd, uint dwFlags);
 
+    [DllImport("user32.dll")]
+    internal static extern nint MonitorFromRect(ref Win32Rect lprc, uint dwFlags);
+
+    [DllImport("Shcore.dll")]
+    internal static extern int GetDpiForMonitor(nint hmonitor, int dpiType, out uint dpiX, out uint dpiY);
+
     [DllImport("user32.dll", EntryPoint = "GetMonitorInfoW", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool GetMonitorInfo(nint hMonitor, ref MonitorInfo lpmi);
@@ -60,6 +66,10 @@ internal static class NativeMethods
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool GetCursorPos(out Win32Point lpPoint);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -192,6 +202,9 @@ internal static class NativeMethods
     internal static extern int GetDIBits(nint hdc, nint hbmp, uint uStartScan, uint cScanLines, byte[]? lpvBits, ref BitmapInfo lpbi, uint uUsage);
 
     internal const int WhKeyboardLl = 13;
+    internal const int WhMouseLl = 14;
+    internal const int WmLButtonDown = 0x0201;
+    internal const int WmLButtonUp = 0x0202;
     internal const int WmKeyDown = 0x0100;
     internal const int WmKeyUp = 0x0101;
     internal const int WmSysKeyDown = 0x0104;
@@ -228,7 +241,6 @@ internal static class NativeMethods
         internal uint Time;
         internal nuint ExtraInfo;
     }
-
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct Win32Rect
