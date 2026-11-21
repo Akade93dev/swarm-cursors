@@ -260,7 +260,12 @@ public sealed class OperationRunner
         string? phase = null)
     {
         long seq;
-        lock (_gate) seq = ++_seq;
+        lock (_gate)
+        {
+            // 排空超时后仍未返回的旧步骤不能再发事件，否则会在新会话/已关闭面板上“复活”步骤。
+            if (kind != "session-end" && !ReferenceEquals(_session, session)) return;
+            seq = ++_seq;
+        }
         _observer.Receive(new OperationEvent(kind, session, view, status, durationMs, phase, seq));
     }
 

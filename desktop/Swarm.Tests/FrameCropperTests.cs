@@ -27,6 +27,16 @@ public class FrameCropperTests
     }
 
     [Fact]
+    public void 裁剪框会返回真实可见区域用于原比例落位()
+    {
+        var frame = new RgbaFrame(100, 50, new byte[100 * 50 * 4]);
+
+        var clamped = FrameCropper.Clamp(frame, new RectInt(-10, -5, 40, 20));
+
+        Assert.Equal(new RectInt(0, 0, 30, 15), clamped);
+    }
+
+    [Fact]
     public void 完全位于截图外的控件不生成空图像()
     {
         var frame = new RgbaFrame(2, 2, new byte[16]);

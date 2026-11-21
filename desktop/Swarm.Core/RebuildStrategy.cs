@@ -80,5 +80,6 @@ public static class RebuildStrategy
     public static int CountNamed(IEnumerable<UiaElementInfo> elements) => elements.Count(IsNamed);
 
     private static bool IsNamed(UiaElementInfo element) =>
-        NamedTypes.Contains(element.ControlType) && !string.IsNullOrWhiteSpace(element.Value ?? element.Name);
+        // 隐藏 Tab 页里的控件也带名字，但它们并没有画在屏幕上；计入会让稀疏语义被误判为可重建。
+        element.HasVisual && NamedTypes.Contains(element.ControlType) && !string.IsNullOrWhiteSpace(element.Value ?? element.Name);
 }

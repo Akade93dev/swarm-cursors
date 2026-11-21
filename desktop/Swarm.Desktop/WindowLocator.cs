@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -54,11 +55,20 @@ public static class WindowLocator
     {
         NativeMethods.GetWindowThreadProcessId(window, out var processId);
         if (processId == 0) throw new ArgumentException("Window does not exist", nameof(window));
-        var process = Process.GetProcessById((int)processId);
+        string processName;
+        try
+        {
+            processName = Process.GetProcessById((int)processId).ProcessName;
+        }
+        catch (Win32Exception error)
+        {
+            // 提权/受保护进程：这不是“找不到窗口”，而是权限不足以读取进程信息。
+            throw new InvalidOperationException($"目标进程受保护或权限不足：{error.Message}", error);
+        }
         var length = GetWindowTextLength(window);
         var text = new StringBuilder(length + 1);
         GetWindowText(window, text, text.Capacity);
-        return new WindowCandidate(window, (int)processId, process.ProcessName, text.ToString());
+        return new WindowCandidate(window, (int)processId, processName, text.ToString());
     }
 
     public static void Activate(nint window)

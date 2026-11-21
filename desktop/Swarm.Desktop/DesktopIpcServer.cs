@@ -1,20 +1,26 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Text;
+using Swarm.Core.Diagnostics;
 
 namespace Swarm.Desktop;
 
 public sealed class DesktopIpcServer
 {
+    private static readonly TimeSpan RequestTimeout = TimeSpan.FromMinutes(1);
+    // 正常请求是几百字节的 JSON；设置上限可避免本机异常/恶意客户端用超长单行耗尽内存。
+    private const int MaxRequestChars = 1 << 20;
     private readonly Func<string, int, Task<string>> _handler;
     private readonly CancellationTokenSource _stop = new();
     private Task? _loop;
 
     public DesktopIpcServer(Func<string, int, Task<string>> handler) => _handler = handler;
 
-    public void Start() => _loop = RunAsync();
+    // 管道 I/O 必须完全离开 UI 线程：同步 drain 或卡死的客户端否则会冻结覆盖层与全局钩子。
+    public void Start() => _loop = Task.Run(RunAsync);
 
     public async Task StopAsync()
     {
@@ -22,8 +28,7 @@ public sealed class DesktopIpcServer
         if (_loop != null)
         {
             try { await _loop; }
-            catch (OperationCanceledException) { }
-            catch (IOException) { }
+            catch (Exception) { /* 关闭阶段任何残留异常都不应阻塞退出 */ }
         }
     }
 
@@ -45,28 +50,44 @@ public sealed class DesktopIpcServer
                 var writer = new StreamWriter(pipe, new UTF8Encoding(false), 16 * 1024, true) { AutoFlush = true, NewLine = "\n" };
                 await using (writer.ConfigureAwait(false))
                 {
-                    var line = await reader.ReadLineAsync(_stop.Token);
+                    string? line;
+                    // 只给“读请求行”限时：真正耗时的本地确认发生在 handler 里，不应被这里截断。
+                    using (var read = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token))
+                    {
+                        read.CancelAfter(RequestTimeout);
+                        line = await ReadLineAsync(reader, read.Token);
+                    }
                     if (line == null) continue;
-                    var response = IsTrustedGateway(processId)
-                        ? await _handler(line, (int)processId)
-                        : UnauthorizedResponse();
+                    string response;
+                    try
+                    {
+                        response = IsTrustedGateway(processId)
+                            ? await _handler(line, (int)processId)
+                            : UnauthorizedResponse();
+                    }
+                    catch (Exception error)
+                    {
+                        FileLog.Write("desktop", $"ipc handler failed: {error.Message}");
+                        response = "{\"id\":\"\",\"ok\":false,\"error\":{\"code\":\"desktop_error\",\"message\":\"本地请求处理失败\"}}";
+                    }
                     await writer.WriteLineAsync(response.AsMemory(), _stop.Token);
                     await writer.FlushAsync(_stop.Token);
                 }
-                pipe.WaitForPipeDrain();
             }
             catch (OperationCanceledException) when (_stop.IsCancellationRequested)
             {
                 break;
             }
-            catch (IOException)
+            catch (Exception error) when (error is IOException or ObjectDisposedException or OperationCanceledException or UnauthorizedAccessException or Win32Exception or InvalidDataException)
             {
-                // The Gateway may time out while local confirmation is still open.
-                // Discard that connection and keep accepting later desktop requests.
+                // 对端超时/断连/超长请求/其他用户进程：丢弃本次连接，继续接受后续请求，避免整个 IPC 静默死亡。
+                FileLog.Write("desktop", $"ipc connection dropped: {error.Message}");
             }
-            catch (ObjectDisposedException)
+            catch (Exception error)
             {
-                // A disconnected client can also surface during writer disposal.
+                // 未预期异常同样不能终止接受循环；短暂退避避免错误持续时忙转。
+                FileLog.Write("desktop", $"ipc loop error: {error.Message}");
+                try { await Task.Delay(200, _stop.Token); } catch (OperationCanceledException) { break; }
             }
         }
     }
@@ -95,6 +116,28 @@ public sealed class DesktopIpcServer
         catch
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// 读取一行请求并限制长度。StreamReader.ReadLineAsync 会把整行缓冲完才返回，
+    /// 本机客户端一旦发送超长行就会占满进程内存，因此改为分块读取并在超限时断开连接。
+    /// </summary>
+    private static async Task<string?> ReadLineAsync(StreamReader reader, CancellationToken token)
+    {
+        var builder = new StringBuilder(1024);
+        var buffer = new char[4096];
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(), token);
+            if (read == 0) return builder.Length == 0 ? null : builder.ToString();
+            for (var i = 0; i < read; i++)
+            {
+                var ch = buffer[i];
+                if (ch == '\n') return builder.ToString().TrimEnd('\r');
+                if (builder.Length >= MaxRequestChars) throw new InvalidDataException("请求超过长度上限");
+                builder.Append(ch);
+            }
         }
     }
 

@@ -243,6 +243,19 @@ internal static class NativeMethods
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    internal struct MouseHookInfo
+    {
+        internal Win32Point Point;
+        internal uint MouseData;
+        internal uint Flags;
+        internal uint Time;
+        internal nuint ExtraInfo;
+
+        /// <summary>LLMHF_INJECTED：SendInput 等注入事件，不能再被 HUD 吞掉。</summary>
+        internal bool IsInjected => (Flags & 0x1) != 0;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     internal struct Win32Rect
     {
         internal int Left;

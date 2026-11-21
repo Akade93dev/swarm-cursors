@@ -23,6 +23,41 @@ test("截屏图块按视觉顺序生成独立重建任务", () => {
   assert.deepEqual(model.tasks.map((task) => task.spec.type), ["image", "image"]);
 });
 
+test("缺少图片源的元素被跳过，不会生成空图请求", () => {
+  const model = createBlueprint({
+    ...base,
+    elements: [
+      { kind: "image", x: 0, y: 0, w: 64, h: 64, src: "" },
+      { kind: "image", x: 64, y: 0, w: 64, h: 64 },
+      { kind: "image", x: 128, y: 0, w: 64, h: 64, src: "data:image/png;base64,AA" },
+    ],
+  });
+
+  assert.equal(model.items.length, 1);
+  assert.equal(model.tasks.length, 1);
+  assert.equal(model.items[0].src, "data:image/png;base64,AA");
+});
+
+test("整屏实拍底座排在最底层并整幅覆盖", () => {
+  const model = createBlueprint({
+    ...base,
+    elements: [
+      { id: "desktop", kind: "image", x: 0, y: 0, w: 320, h: 200, src: "base", semantic: "desktop-base" },
+      { id: "win", kind: "rect", x: 40, y: 30, w: 200, h: 120, css: "background:#fff;" },
+      { parent: "win", kind: "text", x: 50, y: 40, w: 100, h: 20, text: "Hi", fontSize: 13 },
+    ],
+  });
+
+  const [desktop, win, text] = model.items;
+  assert.equal(model.items[0].semantic, "desktop-base");
+  assert.equal(desktop.src, "base");
+  assert.deepEqual([desktop.x, desktop.y, desktop.w, desktop.h], [0, 0, 320, 200]);
+  // 底座不影响窗口与文字的绘制顺序和依赖。
+  assert.deepEqual(model.tasks, [desktop.task, win.task, text.task]);
+  assert.equal(win.task.deps.length, 0);
+  assert.deepEqual(text.task.deps, [win.task]);
+});
+
 test("子元素任务等待父容器完成", () => {
   const model = createBlueprint({
     ...base,

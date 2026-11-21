@@ -121,6 +121,49 @@ public class FontMetricFitterTests
     }
 
     [Fact]
+    public void Fit_SingleCandidateNeverGetsFullConfidence()
+    {
+        // 只有一个候选时没有“第二名”可比，置信度只能来自绝对拟合质量，不能给满分。
+        var fitter = Fitter((("Segoe UI", 400, false), new FontProbe(100, 70, 50, 75, 20)));
+
+        var result = fitter.Fit(new FontFitRequest("H", 100, 70, 7.5, 1));
+
+        Assert.NotNull(result);
+        Assert.True(result!.Confidence is > 0 and < 1, $"confidence={result.Confidence}");
+    }
+
+    [Fact]
+    public void Fit_RejectsPoorBestEvenWhenMarginIsLarge()
+    {
+        // 绝对分超过 0.25 说明度量根本不合：领先第二名再多也不能当可靠反解。
+        var fitter = Fitter(
+            (("Segoe UI", 400, false), new FontProbe(100, 60, 50, 65, 20)),
+            (("Arial", 400, false), new FontProbe(200, 60, 50, 65, 20)));
+
+        var result = fitter.Fit(
+            new FontFitRequest("I", 100, 70, 15, 1),
+            new[] { new FontCandidate("Segoe UI", 400, false), new FontCandidate("Arial", 400, false) });
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void Fit_ClampsConfidenceToOne()
+    {
+        // 第二名字号翻倍时相对置信度会远大于 1，必须收敛到 [0,1]。
+        var fitter = Fitter(
+            (("Segoe UI", 400, false), new FontProbe(100, 70, 50, 75, 20)),
+            (("Arial", 400, false), new FontProbe(150, 70, 50, 75, 20)));
+
+        var result = fitter.Fit(
+            new FontFitRequest("H", 100, 70, 7.5, 1),
+            new[] { new FontCandidate("Segoe UI", 400, false), new FontCandidate("Arial", 400, false) });
+
+        Assert.NotNull(result);
+        Assert.InRange(result!.Confidence, 0, 1);
+    }
+
+    [Fact]
     public void Fit_ReturnsNullForEmptyInk()
     {
         var fitter = Fitter((("Segoe UI", 400, false), new FontProbe(870, 70, 50, 74, 21)));

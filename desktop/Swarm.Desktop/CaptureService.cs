@@ -98,8 +98,8 @@ public static class CaptureService
         if (frame == null || blank)
         {
             var fallback = ScreenCapture.CaptureForWindow(window);
-            var offsetX = clientScreen.X - fallback.Monitor.X;
-            var offsetY = clientScreen.Y - fallback.Monitor.Y;
+            var offsetX = clientScreen.X - fallback.WorkArea.X;
+            var offsetY = clientScreen.Y - fallback.WorkArea.Y;
             frame = Crop(fallback.Frame, offsetX, offsetY, clientBounds.Width, clientBounds.Height) ?? fallback.Frame;
             backend = "screen";
             // 屏幕像素只有在目标确实可见时才可信：前台，或客户区采样点全部归属目标。

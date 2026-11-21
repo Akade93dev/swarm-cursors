@@ -5,7 +5,7 @@ namespace Swarm.Tests;
 public class RebuildStrategyTests
 {
     private static UiaElementInfo Named(string id, string type, string name) =>
-        new() { Id = id, ControlType = type, Name = name, Bounds = new RectInt(0, 0, 20, 20) };
+        new() { Id = id, ControlType = type, Name = name, Bounds = new RectInt(0, 0, 20, 20), HasVisual = true };
 
     private static UiaElementInfo Pane(string id, string name) =>
         new() { Id = id, ControlType = "Pane", Name = name, Bounds = new RectInt(0, 0, 400, 300) };
@@ -73,6 +73,18 @@ public class RebuildStrategyTests
         Assert.Equal(RebuildMode.Semantic, decision.Mode);
         Assert.True(decision.Truncated);
         Assert.Equal(8, decision.NamedControls);
+    }
+
+    [Fact]
+    public void 离屏命名控件不计入语义数量()
+    {
+        var elements = new[]
+        {
+            new UiaElementInfo { Id = "hidden", ControlType = "Button", Name = "隐藏按钮", Bounds = new RectInt(0, 0, 20, 20), HasVisual = false },
+            new UiaElementInfo { Id = "visible", ControlType = "Button", Name = "保存", Bounds = new RectInt(0, 0, 20, 20), HasVisual = true },
+        };
+
+        Assert.Equal(1, RebuildStrategy.CountNamed(elements));
     }
 
     [Fact]

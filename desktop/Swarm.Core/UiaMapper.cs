@@ -61,7 +61,7 @@ public static class UiaMapper
                 || element.ControlType.Equals("Edit", StringComparison.OrdinalIgnoreCase)
                 || element.ControlType.Equals("Document", StringComparison.OrdinalIgnoreCase);
             DesktopElement? mapped = null;
-            if (isText && !string.IsNullOrWhiteSpace(text))
+            if (isText && element.HasVisual && !string.IsNullOrWhiteSpace(text))
             {
                 mapped = new DesktopElement
                 {

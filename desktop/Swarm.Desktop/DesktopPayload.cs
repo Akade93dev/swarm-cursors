@@ -10,37 +10,36 @@ public sealed record DesktopRebuild(object Message, int ElementCount);
 
 public static class DesktopPayload
 {
+    /// <summary>密码框固定掩码：不读取也不传输真实字符，避免明文进入载荷或落盘。</summary>
+    private const string PasswordMask = "••••••••";
+
     /// <summary>Tier B 反解器：GDI 度量 + 候选字体打分，进程内复用度量缓存。</summary>
     private static readonly FontMetricFitter FontFitter = new(new GdiFontMeasurer());
 
+    /// <summary>
+    /// 无 UIA 可用的场景（壁纸、画布网页、游戏窗口）：整屏按原像素一张连续还原，不再切成等大瓦片拼接。
+    /// </summary>
     public static DesktopRebuild Screenshot(CapturedScreen capture)
     {
-        var model = ScreenshotTiler.Tile(capture.Frame);
-        var scale = capture.DpiScale;
-        var elements = model.Tiles.Select(tile => (object)new
-        {
-            id = $"tile-{tile.X}-{tile.Y}",
-            kind = "image",
-            x = tile.X / scale,
-            y = tile.Y / scale,
-            w = tile.Width / scale,
-            h = tile.Height / scale,
-            src = NativeImage.ToDataUrl(new RgbaFrame(tile.Width, tile.Height, tile.Pixels)),
-            semantic = "screenshot",
-        }).ToArray();
-        return Rebuild(capture, model.Background, elements);
+        var viewport = capture.Mapper.ToCssSize(capture.Frame.Width, capture.Frame.Height);
+        var background = NativeImage.AverageCss(
+            capture.Frame,
+            new RectInt(0, 0, capture.Frame.Width, capture.Frame.Height));
+        return Rebuild(capture, background, new[] { BaseLayer(viewport.Width, viewport.Height, capture.Frame) });
     }
 
     public static (DesktopRebuild Rebuild, RebuildDecision Decision) Semantic(CapturedScreen capture, UiaSnapshot snapshot)
     {
-        var scale = capture.DpiScale;
-        var width = capture.Frame.Width / scale;
-        var height = capture.Frame.Height / scale;
+        var mapper = capture.Mapper;
+        var scale = mapper.CssScale;
+        var viewport = mapper.ToCssSize(capture.Frame.Width, capture.Frame.Height);
+        var width = viewport.Width;
+        var height = viewport.Height;
         var physicalById = snapshot.Elements.ToDictionary(element => element.Id);
         var logical = snapshot.Elements.Select(element =>
         {
-            var bounds = CoordinateConverter.ToLogical(element.Bounds, capture.Monitor, scale);
-            var colorBounds = RelativeToCapture(element.Bounds, capture.Monitor);
+            var bounds = mapper.ToCss(element.Bounds);
+            var colorBounds = RelativeToCapture(element.Bounds, capture.WorkArea);
             return new UiaElementInfo
             {
                 Id = element.Id,
@@ -62,6 +61,9 @@ public static class DesktopPayload
         }).ToList();
         var mapped = UiaMapper.Map(logical, width, height);
         var decision = RebuildStrategy.Decide(logical, mapped, snapshot.Truncation);
+        // 语义不足时立即走整屏实拍：继续编码全部控件与整屏 base64 只会白烧预算，
+        // 最后同样被调用方丢弃，还会把原本数百毫秒的重建拖成超时。
+        if (decision.IsFallback) return (Screenshot(capture), decision);
         // 字体信息来自 UIA TextPattern（有预算上限），拿不到的元素再用像素估计兜底。
         var textStyles = UiaTextStyleReader.Read(snapshot);
         var parentById = snapshot.Elements.ToDictionary(item => item.Id, item => item.ParentId, StringComparer.Ordinal);
@@ -72,33 +74,61 @@ public static class DesktopPayload
         var win32Budget = 64;
         // Tier B 每元素要做 20 个候选的 GDI 度量，同样给固定预算，保证整次重建仍是数百毫秒级。
         var fitBudget = 64;
+        // 去拼块：窗口只铺一块连续客户区底色，容器（pane/group）与它同色时不再各自填色。
+        var semanticById = mapped.ToDictionary(item => item.Id, item => item.Semantic, StringComparer.Ordinal);
+        var windowOf = WindowOwners(mapped, parentById, semanticById);
+        var titlebarBottom = TitlebarBottoms(mapped);
+        var clientAreas = ClientAreas(mapped, physicalById, titlebarBottom, capture, scale);
         var elements = new List<object>();
+        // 实拍底座：壁纸、桌面上的其它客户端与网页按原像素整张还原，避免只铺一层平色被看成“一块块拼”。
+        // 被操作的窗口会在它上面整块覆盖并由语义元素重建，因此底座不会和重建文字叠出重影。
+        elements.Add(BaseLayer(width, height, capture.Frame));
         foreach (var element in mapped)
         {
             // 截图元素本身已经带着文字，再叠一层文本只会重影。
             if (element.Kind == "text" && InsideImage(element.Id, parentById, imageIds)) continue;
             textStyles.TryGetValue(element.Id, out var uia);
-            var content = element.Text;
+            // 密码框只画固定掩码：UIA 的 ValuePattern/TextPattern 在部分实现里会回读明文，
+            // 任何情况下都不能让明文进入载荷、WebView 或落盘 dump。
+            var content = element.Sensitive ? PasswordMask : element.Text;
             var edit = element.Semantic is "edit" or "document";
             if (edit)
             {
                 // Edit 的 Name 往往只是关联标签（如 “Display name”），不能当正文用；
                 // 优先 ValuePattern，其次 TextPattern，都读不到就留空。
                 infoById.TryGetValue(element.Id, out var info);
-                content = element.Sensitive ? null : info?.Value;
-                if (string.IsNullOrEmpty(content) && uia?.Text != null && uia.Text != info?.Name) content = uia.Text;
+                if (!element.Sensitive)
+                {
+                    content = info?.Value;
+                    if (string.IsNullOrEmpty(content) && uia?.Text != null && uia.Text != info?.Name) content = uia.Text;
+                }
                 if (string.IsNullOrEmpty(content)) continue;
             }
 
             string? src = null;
+            RectInt? cropBox = null;
+            RectInt cropDesired = default;
             if (element.CropId != null && physicalById.TryGetValue(element.CropId, out var physical))
             {
-                var crop = FrameCropper.Crop(capture.Frame, RelativeToCapture(physical.Bounds, capture.Monitor));
-                if (crop != null) src = NativeImage.ToDataUrl(crop);
+                var desired = RelativeToCapture(physical.Bounds, capture.WorkArea);
+                // 跨屏或贴边元素只保留真实可见的裁剪区域，避免把被截断的图拉伸回原尺寸。
+                if (FrameCropper.Clamp(capture.Frame, desired) is { } box)
+                {
+                    var crop = FrameCropper.Crop(capture.Frame, box);
+                    // 裁剪图的底色抠成透明，控件叠在连续底面上就不会拖着一条不同色的矩形。
+                    if (crop != null)
+                    {
+                        src = NativeImage.ToDataUrl(crop, ClientColor(element.Id, windowOf, clientAreas));
+                        cropBox = box;
+                        cropDesired = desired;
+                    }
+                }
             }
+            // 裁剪失败时没有可画的像素，输出 image 只会让渲染层请求一个空 src。
+            if (element.Kind == "image" && src == null) continue;
 
             var region = physicalById.TryGetValue(element.Id, out var own)
-                ? RelativeToCapture(own.Bounds, capture.Monitor)
+                ? RelativeToCapture(own.Bounds, capture.WorkArea)
                 : default;
             string? css = null;
             string? radius = null;
@@ -113,13 +143,37 @@ public static class DesktopPayload
             var y = element.Y;
             var w = element.W;
             var h = element.H;
+            if (cropBox is { } visible)
+            {
+                // 按真实裁剪区域落位：贴边/跨屏时保持 1:1，只裁掉不可见部分。
+                x += (visible.X - cropDesired.X) / scale;
+                y += (visible.Y - cropDesired.Y) / scale;
+                w = visible.Width / scale;
+                h = visible.Height / scale;
+            }
+            (double Y, double H, Rgb Color)? client = null;
             if (element.Kind == "rect")
             {
                 // 只画真正有绘制的表面：底色取主色（不是会被文字拉灰的均值），四边按像素证据加边框。
                 var style = RegionStyleAnalyzer.Analyze(capture.Frame, region);
-                css = style.ToCss(scale);
                 radius = "0px";
                 color = style.Background.Css;
+                if (element.Semantic == "window")
+                {
+                    // 窗口先按原样填底，随后补一块连续客户区，子容器叠在它上面。
+                    css = style.ToCss(scale);
+                    if (clientAreas.TryGetValue(element.Id, out var area)) client = area;
+                }
+                else if (element.Semantic is "pane" or "group" && IsClientSurface(element.Id, style.Background, windowOf, clientAreas))
+                {
+                    // 与客户区同色的容器只是“被切开的一块”：底色交给客户区，只保留真实边框。
+                    if (!style.HasBorder) continue;
+                    css = style.ToCss(scale, includeBackground: false);
+                }
+                else
+                {
+                    css = style.ToCss(scale);
+                }
             }
             else if (element.Kind == "text")
             {
@@ -193,7 +247,7 @@ public static class DesktopPayload
                 fontFamily = uia?.FontFamily ?? win32?.Family ?? fit?.Family ?? "\"Segoe UI\",\"Microsoft YaHei\",system-ui,sans-serif";
                 fontWeight = (uia?.FontWeight ?? win32?.Weight ?? fit?.Weight ?? 400).ToString();
                 fontStyle = (uia?.Italic ?? win32?.Italic) == true ? "italic" : null;
-                spans = BuildSpans(uia?.Spans, content, fontFamily, fontSize, fontWeight, fontStyle, color);
+                spans = BuildSpans(element.Sensitive ? null : uia?.Spans, content, fontFamily, fontSize, fontWeight, fontStyle, color);
                 // 单行输入框的正文是垂直居中的行盒，不是铺满整个控件矩形。
                 if (edit && element.H <= lineHeight.Value * 2.2)
                 {
@@ -229,8 +283,112 @@ public static class DesktopPayload
                 spans,
                 sensitive = element.Sensitive,
             });
+            if (client is { } clientArea)
+            {
+                // 客户区是整窗唯一的一块连续底色；子容器不再重复填色，画面才不会被切成碎块。
+                elements.Add(new
+                {
+                    id = element.Id + ":client",
+                    parent = element.Id,
+                    kind = "rect",
+                    x = element.X,
+                    y = clientArea.Y,
+                    w = element.W,
+                    h = clientArea.H,
+                    semantic = "surface",
+                    css = $"background-color:{clientArea.Color.Css};",
+                    radius = "0px",
+                    color = clientArea.Color.Css,
+                });
+            }
         }
         return (Rebuild(capture, "rgb(250,250,250)", elements), decision);
+    }
+
+    /// <summary>
+    /// 容器与窗口客户区的色差在 8 个色阶/通道以内时视为同一块表面：各自填色会把整窗切成近似等大的碎块。
+    /// 距离按 L1（三通道差之和）计，24 即每通道 8 级；明显更浅/更深的卡片（如白底描边卡片）仍保留自己的底色。
+    /// </summary>
+    private const double ClientSurfaceTolerance = 24;
+
+    private static bool IsClientSurface(
+        string id,
+        Rgb background,
+        IReadOnlyDictionary<string, string> windowOf,
+        IReadOnlyDictionary<string, (double Y, double H, Rgb Color)> clientAreas) =>
+        windowOf.TryGetValue(id, out var windowId)
+        && clientAreas.TryGetValue(windowId, out var area)
+        && background.Distance(area.Color) <= ClientSurfaceTolerance;
+
+    /// <summary>元素所属窗口的客户区底色；没有窗口归属时返回 null，裁剪图保持原样。</summary>
+    private static Rgb? ClientColor(
+        string id,
+        IReadOnlyDictionary<string, string> windowOf,
+        IReadOnlyDictionary<string, (double Y, double H, Rgb Color)> clientAreas) =>
+        windowOf.TryGetValue(id, out var windowId) && clientAreas.TryGetValue(windowId, out var area)
+            ? area.Color
+            : null;
+
+    /// <summary>每个元素所属的窗口：沿父链找最近的 window 语义元素。</summary>
+    private static Dictionary<string, string> WindowOwners(
+        IReadOnlyList<DesktopElement> mapped,
+        IReadOnlyDictionary<string, string?> parentById,
+        IReadOnlyDictionary<string, string> semanticById)
+    {
+        var owners = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var item in mapped)
+        {
+            var current = item.Id;
+            for (var depth = 0; depth < 32; depth++)
+            {
+                if (semanticById.TryGetValue(current, out var semantic) && semantic == "window")
+                {
+                    owners[item.Id] = current;
+                    break;
+                }
+                if (!parentById.TryGetValue(current, out var parent) || string.IsNullOrEmpty(parent)) break;
+                current = parent;
+            }
+        }
+        return owners;
+    }
+
+    /// <summary>标题栏底边（CSS 像素）：客户区从它下面开始。</summary>
+    private static Dictionary<string, double> TitlebarBottoms(IReadOnlyList<DesktopElement> mapped)
+    {
+        var bottoms = new Dictionary<string, double>(StringComparer.Ordinal);
+        foreach (var item in mapped)
+        {
+            if (item.Semantic != "titlebar" || string.IsNullOrEmpty(item.Parent)) continue;
+            var bottom = item.Y + item.H;
+            bottoms[item.Parent] = bottoms.TryGetValue(item.Parent, out var known) ? Math.Max(known, bottom) : bottom;
+        }
+        return bottoms;
+    }
+
+    /// <summary>窗口内、标题栏以下的连续表面：取主色作为该窗口唯一的客户区底色。</summary>
+    private static Dictionary<string, (double Y, double H, Rgb Color)> ClientAreas(
+        IReadOnlyList<DesktopElement> mapped,
+        IReadOnlyDictionary<string, UiaElementInfo> physicalById,
+        IReadOnlyDictionary<string, double> titlebarBottoms,
+        CapturedScreen capture,
+        double scale)
+    {
+        var areas = new Dictionary<string, (double Y, double H, Rgb Color)>(StringComparer.Ordinal);
+        foreach (var item in mapped)
+        {
+            if (item.Semantic != "window" || !physicalById.TryGetValue(item.Id, out var physical)) continue;
+            var region = RelativeToCapture(physical.Bounds, capture.WorkArea);
+            if (region.Width <= 0 || region.Height <= 0) continue;
+            var top = titlebarBottoms.TryGetValue(item.Id, out var bottom) ? Math.Max(bottom, item.Y) : item.Y;
+            var height = item.Y + item.H - top;
+            if (height <= 4) continue;
+            var outline = RegionStyleAnalyzer.Analyze(capture.Frame, region);
+            var inset = Math.Clamp((int)Math.Round((top - item.Y) * scale), 0, region.Height);
+            var client = new RectInt(region.X, region.Y + inset, region.Width, region.Height - inset);
+            areas[item.Id] = (top, height, RegionStyleAnalyzer.DominantColor(capture.Frame, client, outline.Background));
+        }
+        return areas;
     }
 
     /// <summary>
@@ -315,19 +473,35 @@ public static class DesktopPayload
         }
     }
 
-    private static DesktopRebuild Rebuild(CapturedScreen capture, string background, IReadOnlyCollection<object> elements) =>
-        new(new
+    /// <summary>整屏实拍底座：壁纸、网页、应用界面都按原像素一张连续还原，排在所有重建元素之下。</summary>
+    private static object BaseLayer(double width, double height, RgbaFrame frame) => new
+    {
+        id = "desktop",
+        kind = "image",
+        x = 0d,
+        y = 0d,
+        w = width,
+        h = height,
+        src = NativeImage.ToDataUrl(frame),
+        semantic = "desktop-base",
+    };
+
+    private static DesktopRebuild Rebuild(CapturedScreen capture, string background, IReadOnlyCollection<object> elements)
+    {
+        var viewport = capture.Mapper.ToCssSize(capture.Frame.Width, capture.Frame.Height);
+        return new(new
         {
             type = "rebuild",
             payload = new
             {
-                width = capture.Frame.Width / capture.DpiScale,
-                height = capture.Frame.Height / capture.DpiScale,
+                width = viewport.Width,
+                height = viewport.Height,
                 background,
                 elements,
             },
         }, elements.Count);
+    }
 
-    private static RectInt RelativeToCapture(RectInt physical, RectInt monitor) =>
-        new(physical.X - monitor.X, physical.Y - monitor.Y, physical.Width, physical.Height);
+    private static RectInt RelativeToCapture(RectInt physical, RectInt origin) =>
+        new(physical.X - origin.X, physical.Y - origin.Y, physical.Width, physical.Height);
 }

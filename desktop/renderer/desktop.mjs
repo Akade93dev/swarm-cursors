@@ -31,6 +31,7 @@ function status(text, duration = 2200) {
 }
 
 function mediaFactory(src) {
+  if (!src) return null;
   const image = document.createElement("img");
   image.src = src;
   image.draggable = false;
@@ -175,7 +176,14 @@ function startRebuild(payload) {
   engine.start();
   scheduleFrame(current);
   lastSize = `${innerWidth}x${innerHeight}`;
-  post({ type: "rebuild-ready" });
+  // 等底座实拍解码完再回执首帧：否则覆盖层会先展示一块还没上图的空白画面。
+  const base = model.items[0];
+  const decoded = base && base.media && typeof base.media.decode === "function"
+    ? base.media.decode().catch(() => {})
+    : Promise.resolve();
+  decoded.then(() => {
+    if (current && current.view === view) post({ type: "rebuild-ready" });
+  });
 }
 
 // 30Hz 上限 + 空闲即停：群集安顿后指针静止 2s，缓停帧循环；收到 pointer 或重建事件再唤醒。

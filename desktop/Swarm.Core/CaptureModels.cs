@@ -16,8 +16,6 @@ public sealed class RgbaFrame
     public byte[] Pixels { get; }
 }
 
-public sealed record ScreenshotTile(int X, int Y, int Width, int Height, byte[] Pixels);
-public sealed record ScreenshotModel(int Width, int Height, string Background, IReadOnlyList<ScreenshotTile> Tiles);
 public readonly record struct LogicalRect(double X, double Y, double Width, double Height);
 public readonly record struct LogicalPoint(int X, int Y);
 public readonly record struct LogicalSize(double Width, double Height);

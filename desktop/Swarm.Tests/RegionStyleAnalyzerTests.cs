@@ -88,6 +88,26 @@ public class RegionStyleAnalyzerTests
     }
 
     [Fact]
+    public void ToCss_CanEmitBorderOnlyForContainers()
+    {
+        var frame = Frame(60, 40, 255, 255, 255);
+        for (var x = 0; x < 60; x++)
+        {
+            Set(frame, x, 0, 30, 30, 30);
+            Set(frame, x, 39, 30, 30, 30);
+        }
+
+        var style = RegionStyleAnalyzer.Analyze(frame, new RectInt(0, 0, 60, 40));
+
+        var css = style.ToCss(1, includeBackground: false);
+
+        // 底色交给窗口客户区，容器只保留真实边框，避免逐块填色把画面切成碎块。
+        Assert.True(style.HasBorder);
+        Assert.DoesNotContain("background-color", css);
+        Assert.Contains("border", css);
+    }
+
+    [Fact]
     public void TextColor_PicksGlyphColorInsteadOfBackground()
     {
         var frame = Frame(80, 30, 255, 255, 255);

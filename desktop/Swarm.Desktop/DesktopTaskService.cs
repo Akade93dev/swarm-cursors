@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Text.Json;
@@ -194,6 +195,11 @@ public sealed class DesktopTaskService
         {
             throw new DesktopOperationException("window_closed", "目标进程已退出");
         }
+        catch (Win32Exception error)
+        {
+            // 提权/受保护进程不允许读取 StartTime，应明确告知而不是当作内部错误。
+            throw new DesktopOperationException("elevated_target", $"无法读取目标进程信息（可能以管理员权限运行）：{error.Message}");
+        }
         var identity = new TargetIdentity(candidate.Handle, (int)processId, startTime, NativeMethods.WindowClass(candidate.Handle) ?? string.Empty);
 
         lock (_sync)
@@ -215,7 +221,17 @@ public sealed class DesktopTaskService
         _host.PostMessage(new { type = "task-status", text = $"已授权：{candidate.ProcessName}，目标在前台时 Esc 急停" });
         _watchdog.Start();
         FileLog.Write("desktop", $"task begin pid={candidate.ProcessId} process={candidate.ProcessName} title={candidate.Title} capture={capture.Backend}");
-        return await ObserveInternal(includeScreenshot: true);
+        try
+        {
+            return await ObserveInternal(includeScreenshot: true);
+        }
+        catch
+        {
+            // Begin 失败必须回滚已写入的会话，否则之后每次 task_begin 都会被“已有任务”拒绝。
+            try { await StopLocalAsync(); }
+            catch (Exception cleanup) { FileLog.Write("desktop", $"begin rollback failed: {cleanup.Message}"); }
+            throw;
+        }
     }
 
     private async Task<object> Observe(JsonElement parameters, int gatewayProcessId)

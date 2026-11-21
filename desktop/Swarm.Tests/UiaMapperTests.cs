@@ -25,7 +25,7 @@ public class UiaMapperTests
         var elements = new[]
         {
             new UiaElementInfo { Id = "panel", ControlType = "Pane", Bounds = new RectInt(0, 0, 300, 200), ProcessId = 42, HasVisual = true, Color = "rgb(240,240,240)" },
-            new UiaElementInfo { Id = "edit", ParentId = "panel", ControlType = "Edit", Value = "Hello", Bounds = new RectInt(10, 20, 200, 30), ProcessId = 42 },
+            new UiaElementInfo { Id = "edit", ParentId = "panel", ControlType = "Edit", Value = "Hello", Bounds = new RectInt(10, 20, 200, 30), ProcessId = 42, HasVisual = true },
         };
         var result = UiaMapper.Map(elements, 800, 600);
         Assert.Equal(2, result.Count);
@@ -51,11 +51,22 @@ public class UiaMapperTests
     }
 
     [Fact]
+    public void 离屏文本即使有名字也不进入重建()
+    {
+        var elements = new[]
+        {
+            new UiaElementInfo { Id = "hidden", ControlType = "Text", Name = "隐藏标签", Bounds = new RectInt(10, 20, 80, 20), ProcessId = 42, HasVisual = false },
+        };
+
+        Assert.Empty(UiaMapper.Map(elements, 800, 600));
+    }
+
+    [Fact]
     public void 密码值始终掩码且离屏元素被过滤()
     {
         var elements = new[]
         {
-            new UiaElementInfo { Id = "password", ControlType = "Edit", Value = "secret", IsPassword = true, Bounds = new RectInt(10, 20, 200, 30), ProcessId = 42 },
+            new UiaElementInfo { Id = "password", ControlType = "Edit", Value = "secret", IsPassword = true, Bounds = new RectInt(10, 20, 200, 30), ProcessId = 42, HasVisual = true },
             new UiaElementInfo { Id = "outside", ControlType = "Button", Bounds = new RectInt(900, 20, 200, 30), ProcessId = 42, HasVisual = true },
         };
         var result = UiaMapper.Map(elements, 800, 600);

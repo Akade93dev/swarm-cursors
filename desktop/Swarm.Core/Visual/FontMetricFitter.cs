@@ -65,6 +65,15 @@ public sealed class FontMetricFitter
 
     /// <summary>无法区分候选时宁可回退，也不要“自信地猜错”。</summary>
     private const double MinConfidence = 0.15;
+
+    /// <summary>
+    /// 绝对分门限：领先第二名再多，只要最优候选本身的度量误差超过这个值，就说明模型根本不适用。
+    /// </summary>
+    private const double AbsoluteMinScore = 0.25;
+
+    /// <summary>单候选没有对照组，置信度只能来自绝对质量，因此封顶而不给满分。</summary>
+    private const double SingleCandidateConfidenceCap = 0.8;
+
     private const double ConfidenceFloor = 0.02;
     private const double MinSize = 6;
     private const double MaxSize = 400;
@@ -130,9 +139,15 @@ public sealed class FontMetricFitter
         if (scored.Count == 0) return null;
         scored.Sort((a, b) => a.Score.CompareTo(b.Score));
         var best = scored[0];
-        if (scored.Count == 1) return best with { Confidence = 1 };
+        if (best.Score > AbsoluteMinScore) return null;
+        if (scored.Count == 1)
+        {
+            // 没有第二名可比：用绝对质量折出置信度，并封顶，避免“唯一候选=满分”。
+            var single = Math.Clamp(1 - best.Score, 0, SingleCandidateConfidenceCap);
+            return single < MinConfidence ? null : best with { Confidence = single };
+        }
         var second = scored[1];
-        var confidence = (second.Score - best.Score) / Math.Max(best.Score, ConfidenceFloor);
+        var confidence = Math.Clamp((second.Score - best.Score) / Math.Max(best.Score, ConfidenceFloor), 0, 1);
         if (confidence < MinConfidence) return null;
         return best with { Confidence = confidence };
     }

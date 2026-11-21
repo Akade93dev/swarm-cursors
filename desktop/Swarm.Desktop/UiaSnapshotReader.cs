@@ -39,8 +39,19 @@ public static class UiaSnapshotReader
         options ??= new UiaSnapshotOptions();
         if (window == 0 || !NativeMethods.IsWindow(window)) throw new InvalidOperationException("目标窗口已关闭");
         if (NativeMethods.IsIconic(window)) throw new InvalidOperationException("请先还原最小化的目标窗口");
-        var root = AutomationElement.FromHandle(window) ?? throw new InvalidOperationException("无法读取目标窗口的 UIA 信息");
-        var rootInfo = root.Current;
+        // 窗口在这两步之间关闭时，FromHandle/Current 会抛 ElementNotAvailableException（继承自 SystemException）。
+        // 统一转成 InvalidOperationException，重建流程才能按“窗口不可用”正常降级而不是弹错误框。
+        AutomationElement root;
+        AutomationElement.AutomationElementInformation rootInfo;
+        try
+        {
+            root = AutomationElement.FromHandle(window) ?? throw new InvalidOperationException("无法读取目标窗口的 UIA 信息");
+            rootInfo = root.Current;
+        }
+        catch (ElementNotAvailableException error)
+        {
+            throw new InvalidOperationException("目标窗口已关闭或暂不可用", error);
+        }
         NativeMethods.GetWindowThreadProcessId(window, out var processId);
         var processName = SafeProcessName((int)processId);
         if (!NativeMethods.GetWindowRect(window, out var nativeBounds)) throw new InvalidOperationException("无法读取目标窗口位置");

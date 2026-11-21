@@ -32,11 +32,12 @@ public sealed record RegionStyle(Rgb Background, BorderSide Top, BorderSide Righ
     public bool HasBorder => Top.Visible || Right.Visible || Bottom.Visible || Left.Visible;
 
     /// <summary>转成可以直接贴在重建元素上的 CSS。宽度按显示器缩放折回 CSS 像素。</summary>
-    public string ToCss(double dpiScale)
+    /// <param name="includeBackground">false 时只输出边框：容器底色由父级统一铺，避免逐块填色。</param>
+    public string ToCss(double dpiScale, bool includeBackground = true)
     {
         var scale = dpiScale > 0 ? dpiScale : 1;
         var css = new StringBuilder();
-        css.Append("background-color:").Append(Background.Css).Append(';');
+        if (includeBackground) css.Append("background-color:").Append(Background.Css).Append(';');
         if (!HasBorder) return css.ToString();
         if (Same(Top, Right) && Same(Top, Bottom) && Same(Top, Left))
         {

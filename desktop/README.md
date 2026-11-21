@@ -99,7 +99,7 @@ task_begin  → observe → (focus) → click / type_text / press_key / scroll �
 
 | 热键 | 作用 |
 |---|---|
-| `Alt+Shift+S` | 重建渲染层 |
+| `Alt+Shift+S` | 重建渲染层（UIA 语义重建，读不到时自动降级为截图） |
 | `Alt+Shift+U` | 重建任务 |
 | `Ctrl+Alt+Shift+Esc` | 全局急停，不依赖目标是否在前台 |
 | `Esc` | 目标在前台时停止 AI 操作，不影响目标自身对 Esc 的处理 |

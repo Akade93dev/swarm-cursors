@@ -45,6 +45,8 @@ export function createBlueprint({ width, height, background = "rgb(255,255,255)"
         big: source.w * source.h > width * height * 0.4,
       });
     } else if (source.kind === "image") {
+      // 没有 src 的图片（裁剪越界/读取失败）不能交给 <img>，否则会请求一个 "/null" 空图。
+      if (!source.src) continue;
       Object.assign(item, {
         src: source.src,
         media: null,

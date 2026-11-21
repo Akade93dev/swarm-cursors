@@ -13,8 +13,12 @@ namespace Swarm.Desktop;
 public partial class MainWindow : Window
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    /// <summary>后台重建总预算：超时降级为仅截图，绝不让 UIA/编码把输入卡住。</summary>
+    private static readonly TimeSpan RebuildBudget = TimeSpan.FromSeconds(3);
     private readonly TaskCompletionSource _rendererReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private TaskCompletionSource? _rebuildReady;
+    private TaskCompletionSource<bool>? _rebuildReady;
+    private bool _rebuildRenderFailed;
+    private CancellationTokenSource? _rebuildCts;
     private readonly DesktopTaskService _tasks;
     private readonly DesktopIpcServer _ipcServer;
     private readonly DispatcherTimer _pointerPump;
@@ -142,7 +146,9 @@ public partial class MainWindow : Window
         switch (wParam.ToInt32())
         {
             case 1:
-                _ = Dispatcher.InvokeAsync(() => ToggleRebuild(false));
+                // 主重建热键与任务重建一致：都走 UIA 语义重建，
+                // 否则应用窗口下只是把截图原样贴回，画面和真实屏幕一样，看起来像没响应。
+                _ = Dispatcher.InvokeAsync(() => ToggleRebuild(true));
                 break;
             case 2:
                 _ = Dispatcher.InvokeAsync(() => ToggleRebuild(true));
@@ -184,7 +190,10 @@ public partial class MainWindow : Window
         if (code >= 0 && _hudRectValid && _overlayMode != OverlayMode.None && IsVisible)
         {
             var message = (int)wParam;
-            if ((message == NativeMethods.WmLButtonDown || message == NativeMethods.WmLButtonUp)
+            var info = Marshal.PtrToStructure<NativeMethods.MouseHookInfo>(lParam);
+            // AI 自己注入的点击必须原样落到真实窗口；若被 HUD 吞掉，动作会“执行成功”但界面无反应。
+            if (!info.IsInjected
+                && (message == NativeMethods.WmLButtonDown || message == NativeMethods.WmLButtonUp)
                 && TryCssPointer(out var x, out var y) && _hudRect.Contains(x, y))
             {
                 PostMessage(new { type = "hud-input", action = message == NativeMethods.WmLButtonDown ? "down" : "up", x, y });
@@ -196,63 +205,93 @@ public partial class MainWindow : Window
 
     private async Task ToggleRebuild(bool semantic)
     {
-        if (_transition) return;
+        if (_closed) return;
+        if (_transition)
+        {
+            // 还在准备阶段时再按一次热键 = 取消本次重建，按键始终有反馈。
+            _rebuildCts?.Cancel();
+            return;
+        }
         if (_active)
         {
             StopRebuild();
             return;
         }
         _transition = true;
+        var cts = new CancellationTokenSource();
+        _rebuildCts = cts;
         try
         {
-            await _rendererReady.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await _rendererReady.Task.WaitAsync(TimeSpan.FromSeconds(10), cts.Token);
+            if (_closed) return;
             var foreground = NativeMethods.GetForegroundWindow();
-            if (foreground == 0 || foreground == _handle) return;
-            var capture = ScreenCapture.CaptureForWindow(foreground);
-            DesktopRebuild rebuild;
-            string? notice = null;
-            if (semantic)
+            if (foreground == _handle) return;
+            if (foreground == 0)
             {
-                if (NativeMethods.IsDesktopShell(foreground))
-                {
-                    // 桌面壁纸的 UIA 树只有壁纸文字，直接截屏，也省掉一次超时遍历。
-                    rebuild = DesktopPayload.Screenshot(capture);
-                    notice = Describe(RebuildStrategy.ShellDesktop());
-                }
-                else
-                {
-                    try
-                    {
-                        var snapshot = await Task.Run(() => UiaSnapshotReader.Read(foreground));
-                        var (candidate, decision) = DesktopPayload.Semantic(capture, snapshot);
-                        notice = Describe(decision);
-                        rebuild = decision.IsFallback ? DesktopPayload.Screenshot(capture) : candidate;
-                    }
-                    catch (Exception error) when (error is InvalidOperationException or System.Runtime.InteropServices.COMException or UnauthorizedAccessException)
-                    {
-                        rebuild = DesktopPayload.Screenshot(capture);
-                        notice = "截屏重建 · 无法读取该窗口的辅助功能信息";
-                    }
-                }
-            }
-            else
-            {
-                rebuild = DesktopPayload.Screenshot(capture);
+                // 显示桌面后系统可能没有前台窗口：按主屏整幅实拍还原壁纸，而不是静默无响应。
+                FileLog.Write("desktop", "rebuild: no foreground window, capturing desktop");
+                semantic = false;
             }
 
-            DumpRebuild(rebuild);
-            await ShowWhenReady(capture, rebuild);
-            if (notice != null) PostMessage(new { type = "status", text = notice, duration = 6000 });
+            // 截屏、UIA 遍历、GDI 度量与 PNG/Base64 编码全部在后台线程完成；
+            // UI 线程只负责投递消息与显示覆盖层，重建期间键盘输入不再被同步等待。
+            var outcome = await Task.Run(() => BuildRebuild(foreground, semantic, cts.Token), cts.Token);
+            cts.Token.ThrowIfCancellationRequested();
+            DumpRebuild(outcome.Rebuild);
+            if (!await ShowWhenReady(outcome.Capture, outcome.Rebuild, cts.Token)) return;
+            if (outcome.Notice != null) PostMessage(new { type = "status", text = outcome.Notice, duration = 6000 });
+        }
+        catch (OperationCanceledException)
+        {
+            FileLog.Write("desktop", "rebuild canceled");
         }
         catch (Exception error)
         {
             FileLog.Write("desktop", $"rebuild failed: {error.Message}");
-            StopRebuild();
-            MessageBox.Show(error.Message, "Swarm 桌面重建失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            if (!_closed) MessageBox.Show(error.Message, "Swarm 桌面重建失败", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
         finally
         {
+            if (ReferenceEquals(_rebuildCts, cts)) _rebuildCts = null;
             _transition = false;
+        }
+    }
+
+    private sealed record RebuildOutcome(CapturedScreen Capture, DesktopRebuild Rebuild, string? Notice);
+
+    /// <summary>后台重建流水线：抓一次屏；语义读取超时时复用同一帧降级，避免二次抓屏与双份编码。</summary>
+    private static RebuildOutcome BuildRebuild(nint foreground, bool semantic, CancellationToken token)
+    {
+        var capture = ScreenCapture.CaptureForWindow(foreground);
+        token.ThrowIfCancellationRequested();
+        if (!semantic) return new RebuildOutcome(capture, DesktopPayload.Screenshot(capture), null);
+        if (NativeMethods.IsDesktopShell(foreground))
+        {
+            // 桌面壁纸的 UIA 树只有壁纸文字，直接截屏，也省掉一次超时遍历。
+            return new RebuildOutcome(capture, DesktopPayload.Screenshot(capture), Describe(RebuildStrategy.ShellDesktop()));
+        }
+        try
+        {
+            var snapshotTask = Task.Run(() => UiaSnapshotReader.Read(foreground), token);
+            UiaSnapshot snapshot;
+            try
+            {
+                snapshot = snapshotTask.WaitAsync(RebuildBudget, token).GetAwaiter().GetResult();
+            }
+            catch (TimeoutException)
+            {
+                // 放弃等待后仍观察一次异常，避免后台任务把未处理异常留到进程级。
+                _ = snapshotTask.ContinueWith(static task => _ = task.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                return new RebuildOutcome(capture, DesktopPayload.Screenshot(capture), "截屏重建 · 语义读取超时，已降级为截图");
+            }
+            token.ThrowIfCancellationRequested();
+            var (candidate, decision) = DesktopPayload.Semantic(capture, snapshot);
+            var rebuild = decision.IsFallback ? DesktopPayload.Screenshot(capture) : candidate;
+            return new RebuildOutcome(capture, rebuild, Describe(decision));
+        }
+        catch (Exception error) when (error is InvalidOperationException or System.Runtime.InteropServices.COMException or UnauthorizedAccessException)
+        {
+            return new RebuildOutcome(capture, DesktopPayload.Screenshot(capture), "截屏重建 · 无法读取该窗口的辅助功能信息");
         }
     }
 
@@ -306,6 +345,9 @@ public partial class MainWindow : Window
 
     public void StopRebuild()
     {
+        // 预显示阶段（_active 尚未置位）也必须能取消，否则 Esc/再次热键会空转。
+        _rebuildCts?.Cancel();
+        _rebuildCts = null;
         if (!_active) return;
         _active = false;
         PostMessage(new { type = "rebuild-stop" });
@@ -338,19 +380,37 @@ public partial class MainWindow : Window
         // 覆盖层只负责显示：始终点击穿透、从不激活，用户的真实窗口保持前台和输入权。
         _overlayMode = _tasks.IsActive ? OverlayMode.Task : OverlayMode.Rebuild;
         _hudRectValid = false;
-        ApplyGeometry(capture.Monitor, capture.DpiScale);
+        ApplyGeometry(capture.WorkArea, capture.DpiScale);
         EnsureClickThrough();
     }
 
     /// <summary>等渲染层挂载完图块再现出覆盖层，避免首帧只看到空白背景。</summary>
-    private async Task ShowWhenReady(CapturedScreen capture, DesktopRebuild rebuild)
+    private async Task<bool> ShowWhenReady(CapturedScreen capture, DesktopRebuild rebuild, CancellationToken token)
     {
-        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ready = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         _rebuildReady = ready;
+        _rebuildRenderFailed = false;
         PostMessage(rebuild.Message);
-        await Task.WhenAny(ready.Task, Task.Delay(800));
+        var completed = await Task.WhenAny(ready.Task, Task.Delay(800, token));
         _rebuildReady = null;
+        if (completed == ready.Task)
+        {
+            if (!await ready.Task)
+            {
+                FileLog.Write("desktop", "rebuild rejected by renderer");
+                return false;
+            }
+        }
+        else if (_rebuildRenderFailed)
+        {
+            // 渲染层已明确报错，再显示只会留下一块空白覆盖层。
+            FileLog.Write("desktop", "rebuild renderer failed before first frame");
+            return false;
+        }
+        token.ThrowIfCancellationRequested();
+        if (_closed) return false;
         ShowRebuild(capture);
+        return true;
     }
 
     /// <summary>
@@ -510,13 +570,14 @@ public partial class MainWindow : Window
             using var message = JsonDocument.Parse(e.WebMessageAsJson);
             var root = message.RootElement;
             if (!root.TryGetProperty("type", out var type)) return;
-            switch (type.GetString())
+            var kind = type.ValueKind == JsonValueKind.String ? type.GetString() : null;
+            switch (kind)
             {
                 case "ready":
                     _rendererReady.TrySetResult();
                     break;
                 case "rebuild-ready":
-                    _rebuildReady?.TrySetResult();
+                    _rebuildReady?.TrySetResult(true);
                     break;
                 case "closed":
                     StopRebuild();
@@ -531,15 +592,20 @@ public partial class MainWindow : Window
                     ReadHudRect(root);
                     break;
                 case "renderer-error":
-                    var error = root.TryGetProperty("error", out var detail) ? detail.GetString() : "未知渲染错误";
-                    // 视觉层故障不终止 AI 操作，只降级提示。
+                    var error = root.TryGetProperty("error", out var detail) && detail.ValueKind == JsonValueKind.String
+                        ? detail.GetString()
+                        : "未知渲染错误";
+                    // 首帧之前就失败时不要显示空白覆盖层；已显示后只降级提示，不终止 AI 操作。
+                    _rebuildRenderFailed = true;
+                    _rebuildReady?.TrySetResult(false);
                     PostMessage(new { type = "task-status", text = $"可视化不可用：{error}" });
                     break;
             }
         }
-        catch (JsonException)
+        catch (Exception error)
         {
-            // Malformed renderer messages cannot authorize a native action.
+            // 渲染层消息来自本地页面，但畸形 JSON/类型错误仍不能影响原生输入与重建。
+            FileLog.Write("desktop", $"web message ignored: {error.Message}");
         }
     }
 

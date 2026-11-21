@@ -2,10 +2,17 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using Swarm.Core.Capture;
 using Swarm.Core.Semantics;
+using Swarm.Core.Visual;
 
 namespace Swarm.Desktop;
 
-public sealed record CapturedScreen(RgbaFrame Frame, RectInt Monitor, double DpiScale, nint SourceWindow);
+/// <summary>覆盖层截图结果。原点与覆盖层一致取 work area 左上角，DPI 取显示器而非目标窗口。</summary>
+public sealed record CapturedScreen(RgbaFrame Frame, RectInt WorkArea, uint OverlayDpi, nint SourceWindow)
+{
+    public double DpiScale => OverlayDpi / 96.0;
+
+    public CoordinateMapper Mapper => new(WorkArea, OverlayDpi);
+}
 
 public static class ScreenCapture
 {
@@ -22,9 +29,20 @@ public static class ScreenCapture
             info.Monitor.Top,
             info.Monitor.Right - info.Monitor.Left,
             info.Monitor.Bottom - info.Monitor.Top);
-        var dpi = window == 0 ? 96u : NativeMethods.GetDpiForWindow(window);
-        if (dpi == 0) dpi = 96;
-        return new CapturedScreen(Capture(monitor), monitor, dpi / 96.0, window);
+        // 只铺 work area：任务栏置左/上时，显示器原点与覆盖层原点不同，混用会让整体偏移一条任务栏。
+        var work = info.WorkArea.Right > info.WorkArea.Left && info.WorkArea.Bottom > info.WorkArea.Top
+            ? new RectInt(
+                info.WorkArea.Left,
+                info.WorkArea.Top,
+                info.WorkArea.Right - info.WorkArea.Left,
+                info.WorkArea.Bottom - info.WorkArea.Top)
+            : monitor;
+        // 覆盖层 CSS 基准必须跟着显示器走：DPI-unaware 目标窗口的 GetDpiForWindow 恒为 96，
+        // 用它会把这屏按 100% 折算，150%/200% 屏幕上整层被放大后裁掉。
+        var dpi = 96u;
+        if (monitorHandle != 0 && NativeMethods.GetDpiForMonitor(monitorHandle, 0, out var dpiX, out _) == 0 && dpiX > 0)
+            dpi = dpiX;
+        return new CapturedScreen(Capture(work), work, dpi, window);
     }
 
     private static RgbaFrame Capture(RectInt bounds)
