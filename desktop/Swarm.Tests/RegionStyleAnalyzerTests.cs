@@ -419,4 +419,90 @@ public class RegionStyleAnalyzerTests
 
         Assert.Equal(expected, color.R);
     }
+
+    [Fact]
+    public void InkBounds_ReturnsGlyphBoxInsteadOfControlBounds()
+    {
+        var frame = Frame(100, 40);
+        Fill(frame, new RectInt(20, 10, 40, 20), 20, 20, 20);
+
+        var ink = RegionStyleAnalyzer.InkBounds(frame, new RectInt(0, 0, 100, 40), new Rgb(255, 255, 255));
+
+        Assert.NotNull(ink);
+        Assert.Equal(new RectInt(20, 10, 40, 20), ink!.Value);
+    }
+
+    [Fact]
+    public void InkBounds_ReturnsNullWithoutTextPixels()
+    {
+        var frame = Frame(100, 40);
+
+        Assert.Null(RegionStyleAnalyzer.InkBounds(frame, new RectInt(0, 0, 100, 40), new Rgb(255, 255, 255)));
+    }
+
+    [Fact]
+    public void InkBounds_IgnoresCornerFragmentSeparatedFromGlyphs()
+    {
+        var frame = Frame(140, 26);
+        Fill(frame, new RectInt(10, 8, 100, 15), 30, 30, 30);
+        // 上一排按钮的圆角残留：只有 1 行，且与文字行之间隔着空行。
+        Fill(frame, new RectInt(120, 2, 10, 1), 180, 180, 180);
+
+        var ink = RegionStyleAnalyzer.InkBounds(frame, new RectInt(0, 0, 140, 26), new Rgb(255, 255, 255));
+
+        Assert.NotNull(ink);
+        Assert.Equal(new RectInt(10, 8, 100, 15), ink!.Value);
+    }
+
+    [Fact]
+    public void InkBounds_DropsFullWidthLineAboveText()
+    {
+        var frame = Frame(140, 26);
+        Fill(frame, new RectInt(20, 8, 80, 15), 30, 30, 30);
+        // 上方控件的 1px 底边：横跨整行，但比文字带矮得多。
+        Fill(frame, new RectInt(0, 2, 140, 1), 180, 180, 180);
+
+        var ink = RegionStyleAnalyzer.InkBounds(frame, new RectInt(0, 0, 140, 26), new Rgb(255, 255, 255));
+
+        Assert.NotNull(ink);
+        Assert.Equal(new RectInt(20, 8, 80, 15), ink!.Value);
+    }
+
+    [Fact]
+    public void InkBounds_KeepsSimilarHeightLines()
+    {
+        var frame = Frame(100, 40);
+        Fill(frame, new RectInt(10, 4, 60, 10), 30, 30, 30);
+        Fill(frame, new RectInt(10, 18, 40, 10), 30, 30, 30);
+
+        var ink = RegionStyleAnalyzer.InkBounds(frame, new RectInt(0, 0, 100, 40), new Rgb(255, 255, 255));
+
+        Assert.NotNull(ink);
+        Assert.Equal(new RectInt(10, 4, 60, 24), ink!.Value);
+    }
+
+    [Fact]
+    public void StrokeWidth_UsesNarrowerOfHorizontalAndVerticalRuns()
+    {
+        var frame = Frame(60, 30);
+        // 两条 4px 宽的竖笔画：水平游程 4，垂直游程 20，取小值后中位数应为 4。
+        Fill(frame, new RectInt(10, 5, 4, 20), 20, 20, 20);
+        Fill(frame, new RectInt(24, 5, 4, 20), 20, 20, 20);
+
+        var stroke = RegionStyleAnalyzer.StrokeWidth(
+            frame,
+            new RectInt(10, 5, 18, 20),
+            new Rgb(255, 255, 255));
+
+        Assert.NotNull(stroke);
+        Assert.InRange(stroke!.Value, 3.5, 4.5);
+    }
+
+    [Fact]
+    public void StrokeWidth_ReturnsNullWithoutInk()
+    {
+        var frame = Frame(60, 30);
+
+        Assert.Null(RegionStyleAnalyzer.StrokeWidth(frame, new RectInt(0, 0, 60, 30), new Rgb(255, 255, 255)));
+    }
 }

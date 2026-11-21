@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Automation;
 using System.Windows.Automation.Text;
+using Swarm.Core.Semantics;
 
 namespace Swarm.Desktop;
 
@@ -13,7 +14,8 @@ public sealed record UiaTextStyle(
     bool? Italic,
     string? ColorCss,
     string? Text,
-    bool HasSelection = false);
+    bool HasSelection = false,
+    IReadOnlyList<(string Text, SpanStyle Style)>? Spans = null);
 
 /// <summary>
 /// 逐个控件读取 TextPattern 的字体属性。所有调用都是跨进程的，因此只在文本类控件上、
@@ -86,11 +88,13 @@ public static class UiaTextStyleReader
     private static UiaTextStyle? ReadRange(TextPatternRange range)
     {
         var (fontName, size, weight, italic, color) = ReadAttributes(range);
-        if (ReferenceEquals(fontName, TextPattern.MixedAttributeValue) ||
-            ReferenceEquals(size, TextPattern.MixedAttributeValue) ||
-            ReferenceEquals(weight, TextPattern.MixedAttributeValue) ||
-            ReferenceEquals(italic, TextPattern.MixedAttributeValue) ||
-            ReferenceEquals(color, TextPattern.MixedAttributeValue))
+        var mixed = (
+            Font: ReferenceEquals(fontName, TextPattern.MixedAttributeValue),
+            Size: ReferenceEquals(size, TextPattern.MixedAttributeValue),
+            Weight: ReferenceEquals(weight, TextPattern.MixedAttributeValue),
+            Italic: ReferenceEquals(italic, TextPattern.MixedAttributeValue),
+            Color: ReferenceEquals(color, TextPattern.MixedAttributeValue));
+        if (mixed.Font || mixed.Size || mixed.Weight || mixed.Italic || mixed.Color)
         {
             // 混排时缩到前 8 个字符再读一次，拿到的是该段文字的实际样式而不是 Mixed。
             var head = range.Clone();
@@ -106,7 +110,47 @@ public static class UiaTextStyleReader
         var css = ToColorCss(color);
         var text = SafeText(range);
         if (family == null && points == null && fontWeight == null && css == null && text == null) return null;
-        return new UiaTextStyle(family, points, fontWeight, isItalic, css, text);
+        var uniform = new SpanStyle(family, points, fontWeight, isItalic, css);
+        var spans = mixed.Font || mixed.Size || mixed.Weight || mixed.Italic || mixed.Color
+            ? ReadSpans(range, uniform, mixed)
+            : null;
+        return new UiaTextStyle(family, points, fontWeight, isItalic, css, text) { Spans = spans };
+    }
+
+    /// <summary>
+    /// 逐字符读取混合属性，再合并成连续文本段。跨进程调用很贵，所以只读“整段为 Mixed”的属性，
+    /// 其余属性直接沿用整段读到的统一值；超过时间预算就放弃 span，保留元素级样式。
+    /// </summary>
+    private static IReadOnlyList<(string Text, SpanStyle Style)>? ReadSpans(
+        TextPatternRange range,
+        SpanStyle uniform,
+        (bool Font, bool Size, bool Weight, bool Italic, bool Color) mixed)
+    {
+        var raw = SafeRawText(range, MaxSpanChars + 1);
+        if (raw == null || raw.Length < 2 || raw.Length > MaxSpanChars) return null;
+        // 只去掉尾部空白（通常是段落标记变成的空格），左侧保留以免索引错位。
+        var text = raw.Replace('\r', ' ').Replace('\n', ' ').TrimEnd();
+        if (text.Length < 2) return null;
+        var cursor = range.Clone();
+        cursor.MoveEndpointByRange(TextPatternRangeEndpoint.Start, range, TextPatternRangeEndpoint.Start);
+        cursor.MoveEndpointByRange(TextPatternRangeEndpoint.End, range, TextPatternRangeEndpoint.Start);
+        var styles = new List<SpanStyle?>(text.Length);
+        var clock = Stopwatch.StartNew();
+        for (var i = 0; i < text.Length; i++)
+        {
+            // 必须读单字符窗口 [i, i+1]：跨过样式边界的范围在多数 provider 上都返回 Mixed。
+            cursor.MoveEndpointByRange(TextPatternRangeEndpoint.Start, cursor, TextPatternRangeEndpoint.End);
+            if (cursor.MoveEndpointByUnit(TextPatternRangeEndpoint.End, TextUnit.Character, 1) <= 0) break;
+            styles.Add(new SpanStyle(
+                mixed.Font ? Safe(cursor, TextPattern.FontNameAttribute) as string : uniform.FontFamily,
+                mixed.Size ? ToDouble(Safe(cursor, TextPattern.FontSizeAttribute)) : uniform.FontSizePoints,
+                mixed.Weight ? ToInt(Safe(cursor, TextPattern.FontWeightAttribute)) : uniform.FontWeight,
+                mixed.Italic ? Safe(cursor, TextPattern.IsItalicAttribute) as bool? : uniform.Italic,
+                mixed.Color ? ToColorCss(Safe(cursor, TextPattern.ForegroundColorAttribute)) : uniform.ColorCss));
+            if (clock.ElapsedMilliseconds > SpanBudgetMilliseconds) return null;
+        }
+        var runs = TextSpanMerger.Merge(text, styles);
+        return runs.Count > 1 ? runs : null;
     }
 
     private static (object?, object?, object?, object?, object?) ReadAttributes(TextPatternRange range) =>
@@ -116,6 +160,11 @@ public static class UiaTextStyleReader
             Safe(range, TextPattern.FontWeightAttribute),
             Safe(range, TextPattern.IsItalicAttribute),
             Safe(range, TextPattern.ForegroundColorAttribute));
+
+    /// <summary>逐字符分段只对短文本有意义：太长时无效 span 会把重建切成一堆碎片，且更慢。</summary>
+    private const int MaxSpanChars = 80;
+
+    private const int SpanBudgetMilliseconds = 120;
 
     /// <summary>
     /// TextPattern 的正文可以补上 ValuePattern 缺失的 Edit/Document 内容（WinForms 常见），
@@ -133,6 +182,13 @@ public static class UiaTextStyleReader
         {
             return null;
         }
+    }
+
+    /// <summary>读原始文本（不 Trim），保证逐字符索引与 range 对齐。</summary>
+    private static string? SafeRawText(TextPatternRange range, int maxLength)
+    {
+        try { return range.GetText(maxLength); }
+        catch (Exception error) when (IsUnavailable(error)) { return null; }
     }
 
     private static object? Safe(TextPatternRange range, AutomationTextAttribute attribute)

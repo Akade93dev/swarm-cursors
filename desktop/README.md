@@ -27,7 +27,7 @@
 # 编译（0 警告要求）
 dotnet build desktop\SwarmDesktop.sln -warnaserror
 
-# 单元测试（165 例）
+# 单元测试（189 例）
 dotnet test desktop\SwarmDesktop.sln
 
 # 端到端（P0 路由 14 项 / P1 像素 11 项 / P2 覆盖层 16 项 / Edge 像素 / 焦点路由 12 项）
@@ -110,7 +110,8 @@ task_begin  → observe → (focus) → click / type_text / press_key / scroll �
 
 `Alt+Shift+U` 用 UIA 树加截图像素还原前台窗口，而不是画纯色方块：
 
-- 字体按 `UIA TextPattern → WM_GETFONT(LOGFONT) → 墨迹高度` 三级取值：TextPattern 的磅值按 `×96/72` 换成 CSS 像素；LOGFONT 负高度即 em 高度，按目标进程的 DPI 感知方式折算（DPI_UNAWARE 不再除缩放比）；像素估计按内容分档（含降部 0.92 / 仅帽高 0.72 / CJK 0.88）并过滤 1px 噪声行；全失败时回退 `14px`。
+- 字体按 `UIA TextPattern → WM_GETFONT(LOGFONT) → 墨迹反解 → 像素高度估计` 四级取值：TextPattern 的磅值按 `×96/72` 换成 CSS 像素；LOGFONT 负高度即 em 高度，按目标进程的 DPI 感知方式折算（DPI_UNAWARE 不再除缩放等级）；像素估计按内容分档（含降部 0.92 / 仅帽高 0.72 / CJK 0.88）并过滤 1px 噪声行；全失败时回退 `14px`。
+- 墨迹反解（Tier B）把截图里的墨迹宽/高与笔画宽度当成观测量：用 GDI 在 100px em 下量出候选字体的 advance 宽、帽高、x-height、`k` 上升部、`p` 降部，按 `size = 墨迹宽 / (advance/100)` 反推字号，再比高度、笔画比（常规 0.15 / 粗体 0.30）与字体先验取最优。高度按“控件可能裁掉任意深度降部”建模为区间误差；纯 ASCII 文本优先 Segoe UI 而非同源的 YaHei；top-2 置信度不足 0.15 时返回 null，交回像素估计。墨迹先按行切成连续带，只保留与文字同高的带，相邻控件漏进的 1–2 行边框或圆角不计入包围盒。混排文本按单字符窗口扫描 UIA 属性边界，合并成最多 12 段 `spans`（每段带字体族/字号/字重/斜体/颜色），渲染层逐段生成内联节点。
 - 矩形底色取中央区域的量化直方图众数（均值会被文字拉灰）；四边按自适应深度扫描，候选边框必须在内侧重新回到背景，弱边框还需满足更严格的一致性。
 - 输入框额外补一层底色加边框的表面，正文按行盒垂直居中；底色取内圈薄带，文字统计按已识别边框内缩，避开笔画、边框和选中高亮。
 - TextPattern 报告存在选区时，文字是被反色绘制的，像素里没有原色：按底色明度选深/浅正文色，并放弃被高亮污染的边缘边框。
@@ -144,6 +145,6 @@ task_begin  → observe → (focus) → click / type_text / press_key / scroll �
 
 - Chromium/Electron 系应用 `messageReliable=false`，非前台动作会返回 `needs_foreground`，必须先 `focus`，这会让目标抢占前台。
 - 部分 GPU 渲染窗口 PrintWindow 只能得到空白帧，会降级到屏幕裁剪，结果受遮挡影响。
-- 语义重建只有文本框类控件提供 TextPattern；静态 Label/Button 连 `WM_GETFONT` 也返回 NULL，字号只能靠墨迹高度估计（与真实字号约 ±8%），字重与字体族回退默认值。
-- 混排文本仍只取前 8 字符的单一代表样式；像素兜底不识别字体族、粗体或斜体，也不推断圆角半径、阴影或渐变。
+- 静态 Label/Button 没有 TextPattern、`WM_GETFONT` 也返回 NULL，字体族/字号/字重改由墨迹反解推断；纯 ASCII 小字下 Segoe UI 与 YaHei/Tahoma 度量接近，置信度不足时会回退像素高度估计（字号约 ±8%，字重按笔画比）。
+- 混排 span 仅在 TextPattern 报告 Mixed 时读取：最多 80 字符、120ms 预算，超限的剩余文本整体并入最后一段；段内斜体不参与 Tier B 候选；也不推断圆角半径、阴影或渐变。
 - `publish` 为 framework-dependent，跨机器分发需要目标机安装 .NET 10 运行时。

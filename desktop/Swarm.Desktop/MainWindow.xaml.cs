@@ -240,6 +240,7 @@ public partial class MainWindow : Window
                 rebuild = DesktopPayload.Screenshot(capture);
             }
 
+            DumpRebuild(rebuild);
             await ShowWhenReady(capture, rebuild);
             if (notice != null) PostMessage(new { type = "status", text = notice, duration = 6000 });
         }
@@ -252,6 +253,25 @@ public partial class MainWindow : Window
         finally
         {
             _transition = false;
+        }
+    }
+
+    /// <summary>
+    /// 调试/探针钩子：设置 SWARM_REBUILD_DUMP 指向文件时，把本次重建载荷原样落盘，
+    /// 供黄金探针断言字体与边框，而不是靠肉眼比对截图。
+    /// </summary>
+    private static void DumpRebuild(DesktopRebuild rebuild)
+    {
+        var path = Environment.GetEnvironmentVariable("SWARM_REBUILD_DUMP");
+        if (string.IsNullOrWhiteSpace(path)) return;
+        try
+        {
+            File.WriteAllText(path, JsonSerializer.Serialize(rebuild.Message, JsonOptions));
+            FileLog.Write("desktop", $"rebuild dump={path} elements={rebuild.ElementCount}");
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            FileLog.Write("desktop", $"rebuild dump failed: {error.Message}");
         }
     }
 

@@ -103,3 +103,40 @@ test("物化函数由宿主 DOM 创建可克隆的文本和媒体节点", () => 
   assert.equal(model.items[0].layer, "world");
   assert.equal(model.items[0].op, 1);
 });
+
+test("混排文本为每个 span 生成独立内联节点并覆盖字体样式", () => {
+  const blueprint = createBlueprint({
+    ...base,
+    elements: [{
+      kind: "text", x: 0, y: 0, w: 200, h: 20,
+      text: "ItalicHead normal black text",
+      fontFamily: "Segoe UI", fontSize: 13.5, fontWeight: "400", fontStyle: "italic",
+      spans: [
+        { text: "ItalicHead", fontFamily: "Segoe UI", fontSize: 13.5, fontWeight: "400", fontStyle: "italic" },
+        { text: " normal black text", fontFamily: "Segoe UI", fontSize: 13.5, fontWeight: "400", fontStyle: "normal" },
+      ],
+    }],
+  });
+  const document = {
+    createElement(tag) {
+      return {
+        tag,
+        children: [],
+        style: {},
+        setAttribute(name, value) { this[name] = value; },
+        appendChild(child) { this.children.push(child); return child; },
+        cloneNode() { return { ...this, children: [...this.children] }; },
+      };
+    },
+    createTextNode(text) { return { text }; },
+  };
+
+  const model = materializeModel(blueprint, document, (src) => ({ src, cloneNode() { return this; } }));
+  const full = model.items[0].full;
+
+  assert.equal(full.children.length, 2);
+  assert.equal(full.children[0].tag, "span");
+  assert.equal(full.children[0].children[0].text, "ItalicHead");
+  assert.match(full.children[0].style, /font-style:italic/);
+  assert.match(full.children[1].style, /font-style:normal/);
+});

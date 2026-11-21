@@ -196,6 +196,143 @@ public static class RegionStyleAnalyzer
     }
 
     /// <summary>
+    /// 取文字/图标墨迹的包围盒。Tier B 反解需要的是真实墨迹宽高，而不是带内边距的控件矩形。
+    /// 没有墨迹时返回 null。
+    /// </summary>
+    public static RectInt? InkBounds(RgbaFrame frame, RectInt bounds, Rgb background, int padding = 0)
+    {
+        var rect = Inset(Intersect(frame, bounds), Math.Max(0, padding));
+        if (rect.Width < 2 || rect.Height < 2) return null;
+        var ink = new bool[rect.Width * rect.Height];
+        var rows = new int[rect.Height];
+        for (var row = 0; row < rect.Height; row++)
+        for (var col = 0; col < rect.Width; col++)
+        {
+            var index = ((rect.Y + row) * frame.Width + rect.X + col) * 4;
+            var color = new Rgb(frame.Pixels[index], frame.Pixels[index + 1], frame.Pixels[index + 2]);
+            if (color.Distance(background) < TextContrast) continue;
+            ink[row * rect.Width + col] = true;
+            rows[row]++;
+        }
+        // 按行切成连续的墨迹带。文字带行数远多于相邻控件漏进来的边框/圆角残留，
+        // 后者只有一两行，计入包围盒会把高度撑大 30% 以上，Tier B 反解随之失败。
+        var bands = new List<(int Start, int End)>();
+        for (var row = 0; row < rect.Height; row++)
+        {
+            if (rows[row] == 0) continue;
+            var start = row;
+            while (row + 1 < rect.Height && rows[row + 1] > 0) row++;
+            bands.Add((start, row));
+        }
+        if (bands.Count == 0) return null;
+        var tallest = bands.Max(band => band.End - band.Start + 1);
+        var minimum = Math.Max(2, (int)Math.Round(tallest * 0.4));
+        int left = int.MaxValue, top = int.MaxValue, right = -1, bottom = -1;
+        foreach (var (start, end) in bands)
+        {
+            if (end - start + 1 < minimum) continue;
+            for (var row = start; row <= end; row++)
+            for (var col = 0; col < rect.Width; col++)
+            {
+                if (!ink[row * rect.Width + col]) continue;
+                if (col < left) left = col;
+                if (col > right) right = col;
+                if (row < top) top = row;
+                if (row > bottom) bottom = row;
+            }
+        }
+        if (right < left || bottom < top) return null;
+        return new RectInt(rect.X + left, rect.Y + top, right - left + 1, bottom - top + 1);
+    }
+
+    /// <summary>
+    /// 笔画宽度的稳健估计：对每个墨迹像素取水平/垂直游程的较小值，再取中位数（SWT 思路）。
+    /// 只看接近文字色的“核心像素”，否则抗锯齿边缘会把 1px 常规体量成 3–4px 粗体。
+    /// </summary>
+    public static double? StrokeWidth(RgbaFrame frame, RectInt bounds, Rgb background)
+    {
+        var rect = Intersect(frame, bounds);
+        if (rect.Width < 3 || rect.Height < 3) return null;
+        var width = rect.Width;
+        var height = rect.Height;
+        var distance = new int[width * height];
+        var maxDistance = 0;
+        for (var row = 0; row < height; row++)
+        for (var col = 0; col < width; col++)
+        {
+            var index = ((rect.Y + row) * frame.Width + rect.X + col) * 4;
+            var color = new Rgb(frame.Pixels[index], frame.Pixels[index + 1], frame.Pixels[index + 2]);
+            var value = color.Distance(background);
+            distance[row * width + col] = value;
+            if (value > maxDistance) maxDistance = value;
+        }
+        // 文字色与背景色之间取中点作为核心阈值：留下实心笔画，剔除半透明边缘。
+        var core = Math.Max(TextContrast, maxDistance / 2);
+        var ink = new bool[width * height];
+        var count = 0;
+        for (var i = 0; i < distance.Length; i++)
+        {
+            if (distance[i] < core) continue;
+            ink[i] = true;
+            count++;
+        }
+        if (count < 8) return null;
+
+        var horizontal = new int[width * height];
+        for (var row = 0; row < height; row++)
+        {
+            var col = 0;
+            while (col < width)
+            {
+                var start = row * width + col;
+                if (!ink[start])
+                {
+                    col++;
+                    continue;
+                }
+                var end = col;
+                while (end < width && ink[row * width + end]) end++;
+                var length = end - col;
+                for (var i = col; i < end; i++) horizontal[row * width + i] = length;
+                col = end;
+            }
+        }
+
+        var vertical = new int[width * height];
+        for (var col = 0; col < width; col++)
+        {
+            var row = 0;
+            while (row < height)
+            {
+                if (!ink[row * width + col])
+                {
+                    row++;
+                    continue;
+                }
+                var end = row;
+                while (end < height && ink[end * width + col]) end++;
+                var length = end - row;
+                for (var i = row; i < end; i++) vertical[i * width + col] = length;
+                row = end;
+            }
+        }
+
+        // 大字块逐像素排序代价高；按步长采样到约 4000 个像素即可得到稳定的中位数。
+        var stride = Math.Max(1, (int)Math.Sqrt(count / 4000.0));
+        var strokes = new List<int>(Math.Min(count, 4000));
+        for (var row = 0; row < height; row += stride)
+        for (var col = 0; col < width; col += stride)
+        {
+            var index = row * width + col;
+            if (!ink[index]) continue;
+            strokes.Add(Math.Min(horizontal[index], vertical[index]));
+        }
+        if (strokes.Count == 0) return null;
+        strokes.Sort();
+        return strokes[strokes.Count / 2];
+    }
+
+    /// <summary>
     /// 根据文字像素的行分布估计字号（物理像素）。按行切分文本块，取单行墨迹高度，
     /// 再按是否有降部、是否 CJK 折算成 em，避免固定系数造成的系统性偏小。
     /// </summary>

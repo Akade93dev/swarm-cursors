@@ -69,6 +69,20 @@ export function createBlueprint({ width, height, background = "rgb(255,255,255)"
       item.color = source.color || "rgb(0,0,0)";
       item.fontWeight = source.fontWeight || "400";
       item.fontStyle = source.fontStyle || "normal";
+      // 混排文本：每个文本段自带完整的字体样式，缺失项回退到元素级样式。
+      const spans = Array.isArray(source.spans)
+        ? source.spans
+            .filter((span) => span && typeof span.text === "string" && span.text.length > 0)
+            .map((span) => ({
+              text: span.text,
+              fontFamily: span.fontFamily || item.fontFamily,
+              fs: finite(span.fontSize) ? span.fontSize : item.fs,
+              fontWeight: span.fontWeight || item.fontWeight,
+              fontStyle: span.fontStyle || item.fontStyle,
+              color: span.color || item.color,
+            }))
+        : [];
+      item.spans = spans.length > 1 ? spans : null;
     } else {
       Object.assign(item, {
         pts: source.pts || [],
@@ -116,7 +130,16 @@ export function materializeModel(blueprint, document, mediaFactory) {
     if (item.kind === "text") {
       const full = document.createElement("div");
       full.setAttribute("style", `display:block;margin:0;padding:0;width:100%;height:100%;font-family:${item.fontFamily};font-size:${item.fs}px;line-height:${item.lh}px;font-weight:${item.fontWeight};font-style:${item.fontStyle};color:${item.color};text-align:${item.align};white-space:pre-wrap;overflow:hidden;`);
-      full.appendChild(document.createTextNode(item.text));
+      if (item.spans) {
+        for (const span of item.spans) {
+          const node = document.createElement("span");
+          node.setAttribute("style", `font-family:${span.fontFamily};font-size:${span.fs}px;font-weight:${span.fontWeight};font-style:${span.fontStyle};color:${span.color};`);
+          node.appendChild(document.createTextNode(span.text));
+          full.appendChild(node);
+        }
+      } else {
+        full.appendChild(document.createTextNode(item.text));
+      }
       item.full = full;
     }
     return item;

@@ -10,6 +10,9 @@ public sealed record DesktopRebuild(object Message, int ElementCount);
 
 public static class DesktopPayload
 {
+    /// <summary>Tier B 反解器：GDI 度量 + 候选字体打分，进程内复用度量缓存。</summary>
+    private static readonly FontMetricFitter FontFitter = new(new GdiFontMeasurer());
+
     public static DesktopRebuild Screenshot(CapturedScreen capture)
     {
         var model = ScreenshotTiler.Tile(capture.Frame);
@@ -67,6 +70,8 @@ public static class DesktopPayload
         // WM_GETFONT 是跨进程调用：同一句柄只查一次，并限制总次数，避免慢 provider 拖住重建。
         var win32Fonts = new Dictionary<nint, ResolvedFont?>();
         var win32Budget = 64;
+        // Tier B 每元素要做 20 个候选的 GDI 度量，同样给固定预算，保证整次重建仍是数百毫秒级。
+        var fitBudget = 64;
         var elements = new List<object>();
         foreach (var element in mapped)
         {
@@ -101,6 +106,7 @@ public static class DesktopPayload
             string? fontFamily = null;
             string? fontWeight = null;
             string? fontStyle = null;
+            List<object>? spans = null;
             double? fontSize = null;
             double? lineHeight = null;
             var x = element.X;
@@ -166,18 +172,28 @@ public static class DesktopPayload
                     }
                 }
                 // TextPattern 的 FontSize 单位是磅；只有像素估计需要折回 CSS 像素，默认 14 本身就是 CSS 像素。
+                // 两者都拿不到时走 Tier B：用已知文本反解字号/字重/字体族，比纯像素估计更可靠。
+                FontFitResult? fit = null;
+                if (uia?.FontFamily == null && uia?.FontSizePoints == null && win32 == null && fitBudget > 0)
+                {
+                    fit = FitFromPixels(capture.Frame, region, background, textPadding, content, scale);
+                    if (fit != null) fitBudget--;
+                }
                 var pixels = uia?.FontSizePoints is double points
                     ? points * 96 / 72
                     : win32?.SizeCss is double cssSize
                         ? cssSize
-                        : RegionStyleAnalyzer.EstimateFontSize(capture.Frame, region, background, textPadding, content) is int estimate
-                            ? estimate / scale
-                            : 14;
+                        : fit?.SizeCss is double fitted
+                            ? fitted
+                            : RegionStyleAnalyzer.EstimateFontSize(capture.Frame, region, background, textPadding, content) is int estimate
+                                ? estimate / scale
+                                : 14;
                 fontSize = Math.Clamp(Math.Round(pixels * 2, MidpointRounding.AwayFromZero) / 2, 8, 96);
                 lineHeight = Math.Round(fontSize.Value * 1.3, 1, MidpointRounding.AwayFromZero);
-                fontFamily = uia?.FontFamily ?? win32?.Family ?? "\"Segoe UI\",\"Microsoft YaHei\",system-ui,sans-serif";
-                fontWeight = (uia?.FontWeight ?? win32?.Weight ?? 400).ToString();
+                fontFamily = uia?.FontFamily ?? win32?.Family ?? fit?.Family ?? "\"Segoe UI\",\"Microsoft YaHei\",system-ui,sans-serif";
+                fontWeight = (uia?.FontWeight ?? win32?.Weight ?? fit?.Weight ?? 400).ToString();
                 fontStyle = (uia?.Italic ?? win32?.Italic) == true ? "italic" : null;
+                spans = BuildSpans(uia?.Spans, content, fontFamily, fontSize, fontWeight, fontStyle, color);
                 // 单行输入框的正文是垂直居中的行盒，不是铺满整个控件矩形。
                 if (edit && element.H <= lineHeight.Value * 2.2)
                 {
@@ -210,10 +226,64 @@ public static class DesktopPayload
                 fontFamily,
                 fontWeight,
                 fontStyle,
+                spans,
                 sensitive = element.Sensitive,
             });
         }
         return (Rebuild(capture, "rgb(250,250,250)", elements), decision);
+    }
+
+    /// <summary>
+    /// 混排 span 只有在拼接后与元素正文完全一致时才采用，否则重建会画出与原文不同的文字。
+    /// 每段都写成完整的字体样式（包括显式 normal），避免从容器样式错误继承。
+    /// </summary>
+    private static List<object>? BuildSpans(
+        IReadOnlyList<(string Text, SpanStyle Style)>? runs,
+        string? content,
+        string family,
+        double? size,
+        string weight,
+        string? style,
+        string? color)
+    {
+        if (runs is not { Count: > 1 } || string.IsNullOrEmpty(content)) return null;
+        var joined = string.Concat(runs.Select(run => run.Text));
+        if (!string.Equals(NormalizeText(joined), NormalizeText(content), StringComparison.Ordinal)) return null;
+        return runs.Select(run => (object)new
+        {
+            text = run.Text,
+            fontFamily = run.Style.FontFamily ?? family,
+            fontSize = run.Style.FontSizePoints is double points
+                ? Math.Clamp(Math.Round(points * 96 / 72 * 2, MidpointRounding.AwayFromZero) / 2, 8, 96)
+                : size,
+            fontWeight = (run.Style.FontWeight ?? int.Parse(weight)).ToString(),
+            fontStyle = (run.Style.Italic ?? style == "italic") ? "italic" : "normal",
+            color = run.Style.ColorCss ?? color,
+        }).ToList();
+    }
+
+    private static string NormalizeText(string value) =>
+        value.Replace('\r', ' ').Replace('\n', ' ').Trim();
+
+    /// <summary>
+    /// Tier B 的入口：从截图取该元素真实墨迹的宽、高与笔画宽度，交给度量反解。
+    /// 墨迹不足（纯图标、空白占位）时返回 null，让调用方退回像素估计。
+    /// </summary>
+    private static FontFitResult? FitFromPixels(
+        RgbaFrame frame,
+        RectInt region,
+        Rgb background,
+        int padding,
+        string? text,
+        double scale)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        var ink = RegionStyleAnalyzer.InkBounds(frame, region, background, padding);
+        if (ink is not RectInt box || box.Width < 4 || box.Height < 4) return null;
+        var stroke = RegionStyleAnalyzer.StrokeWidth(frame, box, background);
+        return stroke is double width
+            ? FontFitter.Fit(new FontFitRequest(text, box.Width, box.Height, width, scale))
+            : null;
     }
 
     private static bool InsideImage(
