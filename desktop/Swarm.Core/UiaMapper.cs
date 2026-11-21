@@ -57,7 +57,9 @@ public static class UiaMapper
         {
             if (!element.Bounds.Intersects(viewport)) continue;
             var text = element.Value ?? element.Name;
-            var isText = element.ControlType.Equals("Text", StringComparison.OrdinalIgnoreCase) || element.ControlType.Equals("Edit", StringComparison.OrdinalIgnoreCase);
+            var isText = element.ControlType.Equals("Text", StringComparison.OrdinalIgnoreCase)
+                || element.ControlType.Equals("Edit", StringComparison.OrdinalIgnoreCase)
+                || element.ControlType.Equals("Document", StringComparison.OrdinalIgnoreCase);
             DesktopElement? mapped = null;
             if (isText && !string.IsNullOrWhiteSpace(text))
             {

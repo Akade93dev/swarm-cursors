@@ -35,6 +35,22 @@ public class UiaMapperTests
     }
 
     [Fact]
+    public void 文档使用值生成文本任务()
+    {
+        var elements = new[]
+        {
+            new UiaElementInfo { Id = "doc", ControlType = "Document", Value = "ItalicHead normal black text", Bounds = new RectInt(10, 20, 340, 72), ProcessId = 42, HasVisual = true },
+        };
+
+        var result = UiaMapper.Map(elements, 800, 600);
+
+        var item = Assert.Single(result);
+        Assert.Equal("text", item.Kind);
+        Assert.Equal("document", item.Semantic);
+        Assert.Equal("ItalicHead normal black text", item.Text);
+    }
+
+    [Fact]
     public void 密码值始终掩码且离屏元素被过滤()
     {
         var elements = new[]

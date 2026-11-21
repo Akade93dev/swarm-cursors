@@ -64,6 +64,8 @@ public static class UiaSnapshotReader
         request.Add(AutomationElement.IsOffscreenProperty);
         request.Add(AutomationElement.IsPasswordProperty);
         request.Add(AutomationElement.ProcessIdProperty);
+        // WM_GETFONT 兜底要用原生句柄；放进缓存请求里读取，避免逐元素跨进程往返。
+        request.Add(AutomationElement.NativeWindowHandleProperty);
         request.Add(ValuePattern.Pattern);
 
         // Activate 返回作用域令牌，释放时恢复调用方原有的缓存请求。
@@ -114,7 +116,10 @@ public static class UiaSnapshotReader
                 {
                     try
                     {
-                        if (node.Element.TryGetCachedPattern(ValuePattern.Pattern, out var pattern))
+                        // 老式 WinForms/MSAA provider 往往不支持缓存模式，退回实时读取，否则会把
+                        // 输入框内容误当成关联标签名。
+                        if (node.Element.TryGetCachedPattern(ValuePattern.Pattern, out var pattern) ||
+                            node.Element.TryGetCurrentPattern(ValuePattern.Pattern, out pattern))
                             value = ((ValuePattern)pattern).Current.Value;
                     }
                     catch (Exception error) when (IsUnavailable(error))

@@ -65,9 +65,10 @@ export function createBlueprint({ width, height, background = "rgb(255,255,255)"
       item.align = source.align || "start";
       item.text = text;
       item.sig = text;
-      item.fontFamily = source.fontFamily || "Segoe UI";
+      item.fontFamily = source.fontFamily || '"Segoe UI","Microsoft YaHei",system-ui,sans-serif';
       item.color = source.color || "rgb(0,0,0)";
       item.fontWeight = source.fontWeight || "400";
+      item.fontStyle = source.fontStyle || "normal";
     } else {
       Object.assign(item, {
         pts: source.pts || [],
@@ -114,7 +115,7 @@ export function materializeModel(blueprint, document, mediaFactory) {
     if (item.kind === "image") item.media = mediaFactory(item.src, item);
     if (item.kind === "text") {
       const full = document.createElement("div");
-      full.setAttribute("style", `display:block;margin:0;padding:0;width:100%;height:100%;font-family:${item.fontFamily};font-size:${item.fs}px;line-height:${item.lh}px;font-weight:${item.fontWeight};color:${item.color};text-align:${item.align};white-space:pre-wrap;overflow:hidden;`);
+      full.setAttribute("style", `display:block;margin:0;padding:0;width:100%;height:100%;font-family:${item.fontFamily};font-size:${item.fs}px;line-height:${item.lh}px;font-weight:${item.fontWeight};font-style:${item.fontStyle};color:${item.color};text-align:${item.align};white-space:pre-wrap;overflow:hidden;`);
       full.appendChild(document.createTextNode(item.text));
       item.full = full;
     }
