@@ -52,6 +52,18 @@ foreach ($suite in $suites) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot $suite)
     if ($LASTEXITCODE -ne 0) { $failed += $suite }
 }
+# Cleanup is part of the contract: report anything the suites failed to remove.
+$profiles = @(Get-ChildItem $env:TEMP -Filter 'swarm-edge-profile-*' -Directory -ErrorAction SilentlyContinue)
+$pages = @('swarm-e2e-edge.html', 'swarm-edge-pixels.html' |
+    ForEach-Object { Join-Path $env:TEMP $_ } |
+    Where-Object { Test-Path -LiteralPath $_ })
+$strayEdge = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf('swarm-edge-profile', [StringComparison]::OrdinalIgnoreCase) -ge 0 })
+if ($profiles.Count -gt 0 -or $pages.Count -gt 0 -or $strayEdge.Count -gt 0) {
+    $names = @($profiles.Name) + @($pages | ForEach-Object { Split-Path $_ -Leaf })
+    Write-Warning "e2e left behind: dirs/pages=[$($names -join ', ')] edge=$($strayEdge.Count)"
+}
+
 if ($failed.Count -gt 0) {
     throw "e2e failed: $($failed -join ', ')"
 }
