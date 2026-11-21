@@ -528,7 +528,7 @@ public static class InputDispatcher
     private static Input MouseInput(uint flags, int data = 0) => new()
     {
         Type = 0,
-        Union = new InputUnion { Mouse = new MouseInputData { X = 0, Y = 0, MouseData = data, Flags = flags, Time = 0, ExtraInfo = 0 } },
+        Union = new InputUnion { Mouse = new MouseInputData { X = 0, Y = 0, MouseData = data, Flags = flags, Time = 0, ExtraInfo = NativeMethods.SwarmInputMarker } },
     };
 
     private static void Send(IEnumerable<Input> inputs)

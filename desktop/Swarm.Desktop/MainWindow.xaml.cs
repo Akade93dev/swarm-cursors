@@ -191,8 +191,9 @@ public partial class MainWindow : Window
         {
             var message = (int)wParam;
             var info = Marshal.PtrToStructure<NativeMethods.MouseHookInfo>(lParam);
-            // AI 自己注入的点击必须原样落到真实窗口；若被 HUD 吞掉，动作会“执行成功”但界面无反应。
-            if (!info.IsInjected
+            // AI 自己注入的点击（带 SwarmInputMarker）必须原样落到真实窗口；若被 HUD 吞掉，动作会“执行成功”但界面无反应。
+            // 其余注入（含自动化测试）与真实点击一样按 HUD 命中处理，保证控制条可点。
+            if (info.ExtraInfo != NativeMethods.SwarmInputMarker
                 && (message == NativeMethods.WmLButtonDown || message == NativeMethods.WmLButtonUp)
                 && TryCssPointer(out var x, out var y) && _hudRect.Contains(x, y))
             {

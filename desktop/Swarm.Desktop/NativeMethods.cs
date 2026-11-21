@@ -10,6 +10,8 @@ internal static class NativeMethods
     internal const int WsExTransparent = 0x00000020;
     internal const int WsExToolWindow = 0x00000080;
     internal const int WsExNoActivate = 0x08000000;
+    /// <summary>AI 输入派发写入的 ExtraInfo 标记（"SWAR"）：钩子据此放行，避免 HUD 吞掉本机注入的点击。</summary>
+    internal const nint SwarmInputMarker = 0x53574152;
     internal const uint SwpNoSize = 0x0001;
     internal const uint SwpNoMove = 0x0002;
     internal const uint SwpNoActivate = 0x0010;
@@ -249,10 +251,7 @@ internal static class NativeMethods
         internal uint MouseData;
         internal uint Flags;
         internal uint Time;
-        internal nuint ExtraInfo;
-
-        /// <summary>LLMHF_INJECTED：SendInput 等注入事件，不能再被 HUD 吞掉。</summary>
-        internal bool IsInjected => (Flags & 0x1) != 0;
+        internal nint ExtraInfo;
     }
 
     [StructLayout(LayoutKind.Sequential)]
