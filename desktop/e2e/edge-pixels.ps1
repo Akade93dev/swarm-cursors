@@ -1,11 +1,13 @@
 $ErrorActionPreference = 'Stop'
 $root = (Join-Path $PSScriptRoot '..\publish-verify')
+. (Join-Path $PSScriptRoot 'edge-profile.ps1')
 function Say([string]$text) { Write-Output $text }
 
 $html = Join-Path $env:TEMP 'swarm-edge-pixels.html'
 $page = '<html><head><title>swarm pixels</title><style>html,body{margin:0;height:100%}button{width:100%;height:100%;font-size:48px}</style></head><body><button onclick="this.style.background=''#c33'';this.textContent=''changed''">swarm-pixels</button></body></html>'
 Set-Content -LiteralPath $html -Value $page -Encoding ASCII
 $profile = Join-Path $env:TEMP 'swarm-edge-profile-px'
+Clear-EdgeProfile -Path $profile
 
 $desktop = $null; $gw = $null; $clicker = $null
 try {
@@ -107,8 +109,7 @@ finally {
     if ($gw -and -not $gw.HasExited) { $gw.Kill() }
     if ($desktop -and -not $desktop.HasExited) { $desktop.Kill() }
     if ($clicker) { Receive-Job $clicker -ErrorAction SilentlyContinue | Out-Null; Remove-Job $clicker -Force -ErrorAction SilentlyContinue }
-    Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like "*$profile*" } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Clear-EdgeProfile -Path $profile
+    Remove-Item -LiteralPath $html -Force -ErrorAction SilentlyContinue
     Say 'cleanup done'
 }
