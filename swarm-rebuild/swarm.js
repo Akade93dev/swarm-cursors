@@ -3888,7 +3888,7 @@
     get app() {
       return app;
     },
-    debug: { captureModel, detectEnv, Sound },
+    debug: { captureModel, detectEnv, Sound, View, Engine, cursorSVG },
   };
-  start();
+  if (!window.__swarmDesktopHost) start();
 })();

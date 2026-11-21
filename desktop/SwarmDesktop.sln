@@ -1,0 +1,40 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Swarm.Core", "Swarm.Core\Swarm.Core.csproj", "{EB268D40-4D56-45B0-BC30-6FAF5A4C2DB5}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Swarm.Desktop", "Swarm.Desktop\Swarm.Desktop.csproj", "{2326CDA6-AE1B-4451-B8E2-4F852C6D711E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Swarm.Gateway", "Swarm.Gateway\Swarm.Gateway.csproj", "{5C3D3290-15A1-4DA1-BE9E-391770B28039}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Swarm.Tests", "Swarm.Tests\Swarm.Tests.csproj", "{285A6CD2-9381-432A-937C-EFEB1703D4F4}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{EB268D40-4D56-45B0-BC30-6FAF5A4C2DB5}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{EB268D40-4D56-45B0-BC30-6FAF5A4C2DB5}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{EB268D40-4D56-45B0-BC30-6FAF5A4C2DB5}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{EB268D40-4D56-45B0-BC30-6FAF5A4C2DB5}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2326CDA6-AE1B-4451-B8E2-4F852C6D711E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2326CDA6-AE1B-4451-B8E2-4F852C6D711E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2326CDA6-AE1B-4451-B8E2-4F852C6D711E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2326CDA6-AE1B-4451-B8E2-4F852C6D711E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5C3D3290-15A1-4DA1-BE9E-391770B28039}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5C3D3290-15A1-4DA1-BE9E-391770B28039}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5C3D3290-15A1-4DA1-BE9E-391770B28039}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5C3D3290-15A1-4DA1-BE9E-391770B28039}.Release|Any CPU.Build.0 = Release|Any CPU
+		{285A6CD2-9381-432A-937C-EFEB1703D4F4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{285A6CD2-9381-432A-937C-EFEB1703D4F4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{285A6CD2-9381-432A-937C-EFEB1703D4F4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{285A6CD2-9381-432A-937C-EFEB1703D4F4}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

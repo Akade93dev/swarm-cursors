@@ -3,3 +3,8 @@ dist/
 node_modules/
 *.crx
 *.pem
+desktop/**/bin/
+desktop/**/obj/
+desktop/publish/
+desktop/publish-verify/
+desktop/TestResults/
