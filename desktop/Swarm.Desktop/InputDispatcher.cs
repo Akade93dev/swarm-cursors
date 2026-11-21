@@ -147,6 +147,18 @@ public static class InputDispatcher
         cancellationToken.ThrowIfCancellationRequested();
         if (!IsForeground(window))
             throw new DesktopOperationException("needs_foreground", "前台窗口在动作前发生变化，已取消");
+        if (targetElement != null)
+        {
+            // 无 ValuePattern 的控件只能走真实键盘；先把焦点给到目标元素，否则字符会打到当前焦点控件上。
+            try
+            {
+                await Task.Run(() => targetElement.SetFocus(), cancellationToken);
+            }
+            catch (Exception error) when (error is ElementNotAvailableException or InvalidOperationException or COMException)
+            {
+                // 元素不支持编程聚焦时维持原有行为：输入到当前焦点控件。
+            }
+        }
         NativeMethods.SetCursorPos(screenX, screenY);
         cancellationToken.ThrowIfCancellationRequested();
         SendText(text);

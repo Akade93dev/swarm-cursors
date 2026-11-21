@@ -233,7 +233,12 @@ public sealed class DesktopTaskService
         if (capture.Backend == "screen")
             FileLog.Write("desktop", $"capture fallback handle=0x{identity.Handle:x} occluded={capture.Occluded} blank={capture.Blank}");
         UiaSnapshot? snapshot = null;
-        string? warning = capture.Occluded ? "窗口抓屏不可用，已降级为屏幕裁剪；截图可能包含遮挡窗口" : null;
+        // 两种降级语义分开：backend=screen 是真的没用窗口抓屏；occluded 只是目标不在前台或被遮挡。
+        string? warning = capture.Backend == "screen"
+            ? "窗口抓屏不可用，已降级为屏幕裁剪；截图可能包含其他窗口"
+            : capture.Occluded
+                ? "目标窗口不在前台或已被遮挡；截图可能包含其他窗口"
+                : null;
         try
         {
             snapshot = await Task.Run(() => UiaSnapshotReader.Read(identity.Handle, new UiaSnapshotOptions(IncludePatterns: true, FirstPassMilliseconds: 800)));
@@ -244,7 +249,7 @@ public sealed class DesktopTaskService
         }
         catch (Exception error) when (error is System.Runtime.InteropServices.COMException or UnauthorizedAccessException)
         {
-            warning = $"UIA 暂不可用：{error.Message}";
+            warning = warning == null ? $"UIA 暂不可用：{error.Message}" : $"{warning}；UIA 暂不可用：{error.Message}";
         }
         catch (InvalidOperationException error)
         {
