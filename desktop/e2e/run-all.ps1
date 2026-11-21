@@ -1,5 +1,37 @@
 $ErrorActionPreference = 'Stop'
 $desktop = Split-Path $PSScriptRoot -Parent
+$verifyRoot = Join-Path $desktop 'publish-verify'
+
+# Each suite launches its own Desktop, which cannot coexist with another instance:
+# the single-instance mutex and the IPC pipe are both machine-wide.
+function Get-SwarmInstance {
+    param([string[]]$Names)
+    foreach ($name in $Names) {
+        Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
+            $path = $null
+            try { $path = $_.Path } catch { }
+            [pscustomobject]@{
+                Process  = $_
+                Path     = $path
+                IsVerify = ($path -and $path.StartsWith($verifyRoot, [StringComparison]::OrdinalIgnoreCase))
+            }
+        }
+    }
+}
+
+$instances = @(Get-SwarmInstance -Names @('Swarm.Desktop', 'Swarm.Gateway'))
+$leftovers = @($instances | Where-Object IsVerify)
+foreach ($item in $leftovers) {
+    $item.Process | Stop-Process -Force -ErrorAction SilentlyContinue
+    Write-Output "stopped leftover: $($item.Process.ProcessName) pid $($item.Process.Id)"
+}
+if ($leftovers.Count -gt 0) { Start-Sleep -Seconds 1 }
+
+$blocking = @(Get-SwarmInstance -Names @('Swarm.Desktop') | Where-Object { -not $_.IsVerify })
+if ($blocking.Count -gt 0) {
+    $detail = ($blocking | ForEach-Object { "pid $($_.Process.Id) at $($_.Path)" }) -join '; '
+    throw "Swarm.Desktop is already running ($detail). Its single-instance mutex blocks e2e; exit that instance first."
+}
 
 Write-Output '== publish-verify =='
 Push-Location $desktop
