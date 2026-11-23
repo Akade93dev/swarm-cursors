@@ -61,6 +61,9 @@ public static class SetOfMarkBuilder
         return result;
     }
 
+    /// <summary>公开分类入口 (供 HierarchicalScreenParser / DesktopTaskService 等调用).</summary>
+    internal static SoMKind ClassifyStatic(string text) => Classify(text);
+
     private static SoMKind Classify(string text)
     {
         var trimmed = text.Trim();

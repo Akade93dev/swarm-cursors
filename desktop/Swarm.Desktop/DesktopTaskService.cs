@@ -400,35 +400,63 @@ public sealed class DesktopTaskService
             throw new DesktopOperationException("window_closed", error.Message);
         }
 
-        // P2 Fallback: UIA 不可用时走 OCR + SoM 视觉兜底.
+        // P2 TRISHUL HSP: 不管 UIA 可用与否, 都跑双层粒度 SoM 融合.
+        // UIA 可用 → 翻译 UIA elements + OCR 增强 → HSP Build (粗→细 + SEED 空间语义)
+        // UIA 不可用 → 纯 OCR → SetOfMarkBuilder.Build (向后兼容)
         string provenance = "uia";
         string? fallbackReason = null;
         List<SoMElement>? somElements = null;
-        if (snapshot == null && capture.Frame != null && !capture.Occluded)
+
+        // viewport 提前算好, HSP 需要用归一化坐标
+        var dpiForHsp = capture.DpiScale;
+        var clientForHsp = capture.ClientBounds;
+        var clientScreenForHsp = capture.ClientScreen;
+        var viewportHsp = CoordinateConverter.ClientViewport(clientForHsp, dpiForHsp);
+        var viewportW = viewportHsp.Width;
+        var viewportH = viewportHsp.Height;
+
+        var ocrLines = Array.Empty<OcrLine>() as IReadOnlyList<OcrLine>;
+        if (capture.Frame != null && !capture.Occluded && _ocrService.IsAvailable)
         {
-            var ocr = _ocrService;
-            if (ocr.IsAvailable)
+            try
             {
-                try
-                {
-                    var lines = await ocr.OcrAsync(capture.Frame);
-                    if (lines.Count > 0)
-                    {
-                        provenance = "ocr";
-                        fallbackReason = "uia_unavailable";
-                        somElements = SetOfMarkBuilder.Build(lines).ToList();
-                        FileLog.Write("desktop", $"observe fallback OCR lines={lines.Count} somMarks={somElements.Count}");
-                    }
-                }
-                catch (Exception error)
-                {
-                    FileLog.Write("desktop", $"observe fallback OCR error: {error.Message}");
-                }
+                ocrLines = await _ocrService.OcrAsync(capture.Frame);
             }
-            else
+            catch (Exception ocrErr)
             {
-                fallbackReason = "ocr_unavailable";
+                FileLog.Write("desktop", $"observe OCR error: {ocrErr.Message}");
             }
+        }
+
+        if (snapshot != null && snapshot.Elements.Count > 0)
+        {
+            // ===== TRISHUL HSP 融合路径: UIA + OCR 双层粒度 =====
+            var (regions, interactives) = TranslateUiaToHsp(
+                snapshot.Elements, clientScreenForHsp, dpiForHsp, viewportW, viewportH);
+
+            if (regions.Count > 0 || interactives.Count > 0 || ocrLines.Count > 0)
+            {
+                somElements = HierarchicalScreenParser.Build(
+                    regions, interactives, ocrLines, viewportW, viewportH).ToList();
+                provenance = "hsp";
+                FileLog.Write("desktop", $"observe HSP regions={regions.Count} interactives={interactives.Count} ocr={ocrLines.Count} somMarks={somElements.Count}");
+            }
+        }
+        else if (ocrLines.Count > 0)
+        {
+            // ===== 纯 OCR fallback 路径 (向后兼容) =====
+            provenance = "ocr";
+            fallbackReason = "uia_unavailable";
+            somElements = SetOfMarkBuilder.Build(ocrLines).ToList();
+            FileLog.Write("desktop", $"observe fallback OCR lines={ocrLines.Count} somMarks={somElements.Count}");
+        }
+        else if (_ocrService.IsAvailable)
+        {
+            fallbackReason = "ocr_no_text";
+        }
+        else
+        {
+            fallbackReason = "ocr_unavailable";
         }
 
         if (progress != null) await progress.Report(0.55, "uia");
@@ -1224,6 +1252,82 @@ public sealed class DesktopTaskService
         if (reason == null) return;
         _host.PostMessage(new { type = "task-status", text = reason });
         await StopLocalAsync();
+    }
+
+    private static (List<HspRegion> Regions, List<HspInteractive> Interactives) TranslateUiaToHsp(
+        IReadOnlyList<UiaElementInfo> elements,
+        RectInt clientScreen,
+        double dpiScale,
+        double viewportW,
+        double viewportH)
+    {
+        var regions = new List<HspRegion>();
+        var interactives = new List<HspInteractive>();
+
+        // 粗粒度容器 ControlType → RegionType 映射
+        static string? MapRegionType(string ct) => ct switch
+        {
+            "TitleBar" => "TitleBar",
+            "MenuBar" or "ToolBar" or "SplitButton" or "SystemMenuBar" => "MenuBar",
+            "StatusBar" or "ScrollBar" => "StatusBar",
+            _ => null,
+        };
+
+        // 可交互 ControlType → RegionType
+        static bool IsInteractive(string ct) => ct switch
+        {
+            "Button" or "SplitButton" or "CheckBox" or "RadioButton" or "Hyperlink"
+            or "MenuItem" or "ComboBox" or "Edit" or "TabItem" or "ListItem"
+            or "Slider" => true,
+            _ => false,
+        };
+
+        foreach (var el in elements)
+        {
+            if (!el.HasVisual || el.Bounds.Width <= 0 || el.Bounds.Height <= 0) continue;
+            if (!el.Bounds.Intersects(clientScreen)) continue;
+
+            // 归一化坐标: ToClient 返回 CSS pixel, 再 / viewport 得 [0,1]
+            var clientBounds = CoordinateConverter.ToClient(el.Bounds, clientScreen, dpiScale);
+            double nx = viewportW > 0 ? clientBounds.X / viewportW : 0;
+            double ny = viewportH > 0 ? clientBounds.Y / viewportH : 0;
+            double nw = viewportW > 0 ? (double)clientBounds.Width / viewportW : 0;
+            double nh = viewportH > 0 ? (double)clientBounds.Height / viewportH : 0;
+
+            if (nw <= 0 || nh <= 0) continue;
+
+            var regionType = MapRegionType(el.ControlType);
+            if (regionType != null && (nw > 0.10 || nh > 0.05))
+            {
+                // 大尺寸容器才算 Layer 1 (排除小 MenuItem 被误判为 MenuBar)
+                regions.Add(new HspRegion(el.Id, regionType, nx, ny, nw, nh));
+            }
+
+            if (IsInteractive(el.ControlType))
+            {
+                var text = (el.Value ?? el.Name ?? "").Trim();
+                interactives.Add(new HspInteractive(
+                    SourceId: el.Id,
+                    UiaControlType: el.ControlType,
+                    Text: string.IsNullOrEmpty(text) ? el.ControlType : text,
+                    X: nx, Y: ny, W: nw, H: nh,
+                    Confidence: 1.0));
+            }
+        }
+
+        // 特殊: 找 Document 类型作为 ContentArea
+        foreach (var el in elements.Where(e => e.ControlType.Equals("Document", StringComparison.OrdinalIgnoreCase) && e.HasVisual))
+        {
+            var clientBounds = CoordinateConverter.ToClient(el.Bounds, clientScreen, dpiScale);
+            double nx = viewportW > 0 ? clientBounds.X / viewportW : 0;
+            double ny = viewportH > 0 ? clientBounds.Y / viewportH : 0;
+            double nw = viewportW > 0 ? (double)clientBounds.Width / viewportW : 0;
+            double nh = viewportH > 0 ? (double)clientBounds.Height / viewportH : 0;
+            if (nw > 0 && nh > 0)
+                regions.Add(new HspRegion(el.Id, "ContentArea", nx, ny, nw, nh));
+        }
+
+        return (regions, interactives);
     }
 
     private static UiaElementInfo? Element(string? id, UiaSnapshot? snapshot)
