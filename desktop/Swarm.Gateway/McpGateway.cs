@@ -58,6 +58,8 @@ public sealed class McpGateway
                         return null;
                     case "initialize":
                         return hasId ? RpcResult(id, InitializeResult(root)) : null;
+                    case "server/discover":
+                        return hasId ? RpcResult(id, DiscoverResult()) : null;
                     case "ping":
                         return hasId ? RpcResult(id, new { }) : null;
                     case "tools/list":
@@ -216,13 +218,14 @@ public sealed class McpGateway
             Func<DesktopProgress, Task>? progress = progressToken is not null && _notify is not null
                 ? update => _notify(ProgressNotification(progressToken.Value, update))
                 : null;
+            var protocolVersion = NegotiatedProtocolVersion(root);
             var response = await _transport.SendAsync(name, JsonSerializer.SerializeToElement(parameters), cancellationToken, progress);
-            return response.Ok ? ToolSuccess(response.Result) : ToolFailure(response.Error!);
+            return response.Ok ? ToolSuccess(response.Result, protocolVersion) : ToolFailure(response.Error!, protocolVersion);
         }
         catch (DesktopUnavailableException exception)
         {
             FileLog.Write("gateway", $"desktop unavailable: {exception.Message}");
-            return ToolFailure(new DesktopIpcError("desktop_unavailable", exception.Message));
+            return ToolFailure(new DesktopIpcError("desktop_unavailable", exception.Message), null);
         }
         catch (OperationCanceledException)
         {
@@ -232,11 +235,11 @@ public sealed class McpGateway
         catch (Exception exception)
         {
             FileLog.Write("gateway", $"{name} transport error: {exception.GetType().Name}: {exception.Message}");
-            return ToolFailure(new DesktopIpcError("desktop_transport_error", exception.Message));
+            return ToolFailure(new DesktopIpcError("desktop_transport_error", exception.Message), null);
         }
     }
 
-    private static object ToolSuccess(JsonElement result)
+    private static object ToolSuccess(JsonElement result, string? protocolVersion)
     {
         if (result.ValueKind == JsonValueKind.Object)
         {
@@ -248,37 +251,126 @@ public sealed class McpGateway
                 mimeType.StartsWith("image/", StringComparison.Ordinal) && data.Length > 0)
             {
                 observation.Remove("screenshot");
-                return new
-                {
-                    structuredContent = JsonSerializer.SerializeToElement(root),
-                    content = new object[]
-                    {
-                        new { type = "text", text = root.ToJsonString() },
-                        new { type = "image", mimeType, data },
-                    },
-                };
             }
+        }
+
+        // 先按 legacy 形状构造（structuredContent + content），再按协议版本包装 resultType + _meta。
+        var (legacyStructured, legacyContent) = BuildLegacySuccessShape(result);
+        if (protocolVersion != ModernProtocolVersion)
+        {
+            return new { structuredContent = legacyStructured, content = legacyContent };
+        }
+
+        // MRTR: success 形状 = legacy + resultType + _meta 回显 + confirmToken 提升为 input_required
+        if (TryExtractConfirmToken(result, out var confirmToken, out var actionLabel))
+        {
+            return new
+            {
+                _meta = new { protocolVersion = ModernProtocolVersion, requestId = (string?)null, timestamp = DateTimeOffset.UtcNow },
+                resultType = "input_required",
+                confirmToken,
+                actionLabel,
+                structuredContent = ExtractStructuredContent(result),
+                input = new
+                {
+                    type = "confirm_required",
+                    confirmToken,
+                    prompt = $"Confirm {actionLabel}. Pass confirmToken back with the same action.",
+                    expiresInMs = 5_000,
+                },
+            };
         }
 
         return new
         {
-            structuredContent = result,
-            content = new[] { new { type = "text", text = result.GetRawText() } },
+            _meta = new { protocolVersion = ModernProtocolVersion, requestId = (string?)null, timestamp = DateTimeOffset.UtcNow },
+            resultType = "success",
+            structuredContent = ExtractStructuredContent(result),
+            content = legacyContent,
         };
     }
 
-    private static object ToolFailure(DesktopIpcError error)
+    private static object ToolFailure(DesktopIpcError error, string? protocolVersion)
     {
-        var structuredContent = new
+        var legacy = new
         {
-            error = new { code = error.Code, reason = error.Reason, message = error.Message },
-        };
-        return new
-        {
-            structuredContent,
-            content = new[] { new { type = "text", text = JsonSerializer.Serialize(structuredContent) } },
+            structuredContent = new { error = new { code = error.Code, reason = error.Reason, message = error.Message } },
+            content = new[] { new { type = "text", text = JsonSerializer.Serialize(new { error = new { code = error.Code, reason = error.Reason, message = error.Message } }) } },
             isError = true,
         };
+        if (protocolVersion != ModernProtocolVersion) return legacy;
+
+        // MRTR: blocked 形状 = error code + structuredContent
+        var isPolicyDenied = error.Code == "policy_denied" || error.Code.EndsWith("_denied", StringComparison.Ordinal);
+        return new
+        {
+            _meta = new { protocolVersion = ModernProtocolVersion, requestId = (string?)null, timestamp = DateTimeOffset.UtcNow },
+            resultType = isPolicyDenied ? "blocked" : "success",
+            structuredContent = legacy.structuredContent,
+            content = legacy.content,
+            isError = legacy.isError,
+        };
+    }
+
+    private static (object structuredContent, object content) BuildLegacySuccessShape(JsonElement result)
+    {
+        if (result.ValueKind == JsonValueKind.Object)
+        {
+            var root = JsonNode.Parse(result.GetRawText())!.AsObject();
+            var observation = root["observation"] is JsonObject nested ? nested : root;
+            if (observation["screenshot"] is JsonObject screenshot &&
+                screenshot["mimeType"] is JsonValue mimeValue && mimeValue.TryGetValue<string>(out var mimeType) &&
+                screenshot["data"] is JsonValue dataValue && dataValue.TryGetValue<string>(out var data) &&
+                mimeType.StartsWith("image/", StringComparison.Ordinal) && data.Length > 0)
+            {
+                observation.Remove("screenshot");
+                return (
+                    JsonSerializer.SerializeToElement(root),
+                    new object[]
+                    {
+                        new { type = "text", text = root.ToJsonString() },
+                        new { type = "image", mimeType, data },
+                    }
+                );
+            }
+        }
+        return (result.Clone(), new[] { new { type = "text", text = result.GetRawText() } });
+    }
+
+    private static bool TryExtractConfirmToken(JsonElement result, out string token, out string actionLabel)
+    {
+        token = null!;
+        actionLabel = null!;
+        if (result.ValueKind != JsonValueKind.Object) return false;
+        if (!result.TryGetProperty("confirmToken", out var ct) || ct.ValueKind != JsonValueKind.String || string.IsNullOrEmpty(ct.GetString())) return false;
+        token = ct.GetString()!;
+        actionLabel = result.TryGetProperty("label", out var label) && label.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(label.GetString())
+            ? label.GetString()!
+            : "the action";
+        return true;
+    }
+
+    private static JsonElement ExtractStructuredContent(JsonElement result)
+    {
+        if (result.ValueKind == JsonValueKind.Object && result.TryGetProperty("observation", out var observation) && observation.ValueKind == JsonValueKind.Object)
+            return observation.Clone();
+        return result.Clone();
+    }
+
+    /// <summary>
+    /// 从 params._meta.protocolVersion 读取协商协议版本；
+    /// modern 客户端显式声明 "2025-06-18" 时返回 MRTR 形状，否则返回 null（legacy 默认）。
+    /// </summary
+    private static string? NegotiatedProtocolVersion(JsonElement root)
+    {
+        if (!root.TryGetProperty("params", out var parameters) || parameters.ValueKind != JsonValueKind.Object ||
+            !parameters.TryGetProperty("_meta", out var meta) || meta.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+        if (!meta.TryGetProperty("protocolVersion", out var version) || version.ValueKind != JsonValueKind.String) return null;
+        var requested = version.GetString();
+        return requested is not null && Array.IndexOf(SupportedProtocolVersions, requested) >= 0 ? requested : null;
     }
 
     private static string RpcResult(object? id, object result) => JsonSerializer.Serialize(new Dictionary<string, object?>
@@ -295,10 +387,9 @@ public sealed class McpGateway
         ["error"] = data is null ? new { code, message } : new { code, message, data },
     });
 
-    // 目前只声明已完整实现的基础版本。等进度/取消（2025-03-26 起的基础能力）落地后，
-    // 再把 "2025-03-26" / "2025-06-18" 加入列表并按其结构补全 outputSchema。
-    private static readonly string[] SupportedProtocolVersions = { "2024-11-05" };
+    private static readonly string[] SupportedProtocolVersions = { "2024-11-05", "2025-06-18" };
     private const string FallbackProtocolVersion = "2024-11-05";
+    private const string ModernProtocolVersion = "2025-06-18";
 
     private static object InitializeResult(JsonElement root)
     {
@@ -315,11 +406,46 @@ public sealed class McpGateway
         return new
         {
             protocolVersion = negotiated,
-            capabilities = new { tools = new { listChanged = false } },
-            serverInfo = new { name = "swarm-desktop", version = "1.0.0" },
+            capabilities = new
+            {
+                tools = new { listChanged = false },
+                governance = new
+                {
+                    policy = true,
+                    confirmToken = true,
+                    redactions = new[] { "password", "credential", "email", "id", "bank", "phone" },
+                    blockedResult = true,
+                    inputRequiredResult = true,
+                },
+            },
+            serverInfo = new { name = "swarm-desktop", version = "1.0.0", protocolVersions = SupportedProtocolVersions },
             instructions = "Call task_begin first to obtain local user authorization. Coordinates are window-client CSS pixels returned by observe; elementId takes precedence. Screenshots are returned on task_begin and on explicit observe requests. The desktop never steals foreground: if an action returns needs_foreground, call focus first. Esc stops when the target is focused; Ctrl+Alt+Shift+Esc always stops.",
         };
     }
+
+    /// <summary>
+    /// 2025-06-18 新增的 MCP discover 端点：声明完整能力矩阵，
+    /// 让客户端在 initialize 之前就知道支持哪些 MRTR 功能。
+    /// </summary
+    private static object DiscoverResult() => new
+    {
+        protocolVersions = SupportedProtocolVersions,
+        defaultProtocolVersion = FallbackProtocolVersion,
+        capabilities = new
+        {
+            tools = new { listChanged = false },
+            governance = new
+            {
+                policy = true,
+                confirmToken = true,
+                redactions = new[] { "password", "credential", "email", "id", "bank", "phone" },
+                blockedResult = true,
+                inputRequiredResult = true,
+            },
+        },
+        serverInfo = new { name = "swarm-desktop", version = "1.0.0" },
+        endpoints = new[] { "initialize", "tools/list", "tools/call", "server/discover" },
+    };
 
     private static object[] ToolDefinitions() => new object[]
     {

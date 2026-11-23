@@ -26,11 +26,29 @@
                                                                      "capabilities":  {
                                                                                           "tools":  {
                                                                                                         "listChanged":  false
-                                                                                                    }
+                                                                                                    },
+                                                                                          "governance":  {
+                                                                                                             "policy":  true,
+                                                                                                             "confirmToken":  true,
+                                                                                                             "redactions":  [
+                                                                                                                                "password",
+                                                                                                                                "credential",
+                                                                                                                                "email",
+                                                                                                                                "id",
+                                                                                                                                "bank",
+                                                                                                                                "phone"
+                                                                                                                            ],
+                                                                                                             "blockedResult":  true,
+                                                                                                             "inputRequiredResult":  true
+                                                                                                         }
                                                                                       },
                                                                      "serverInfo":  {
                                                                                         "name":  "swarm-desktop",
-                                                                                        "version":  "1.0.0"
+                                                                                        "version":  "1.0.0",
+                                                                                        "protocolVersions":  [
+                                                                                                                  "2024-11-05",
+                                                                                                                  "2025-06-18"
+                                                                                                              ]
                                                                                     },
                                                                      "instructions":  "Call task_begin first to obtain local user authorization. Coordinates are window-client CSS pixels returned by observe; elementId takes precedence. Screenshots are returned on task_begin and on explicit observe requests. The desktop never steals foreground: if an action returns needs_foreground, call focus first. Esc stops when the target is focused; Ctrl+Alt+Shift+Esc always stops."
                                                                  }
@@ -64,11 +82,29 @@
                                                                      "capabilities":  {
                                                                                           "tools":  {
                                                                                                         "listChanged":  false
-                                                                                                    }
+                                                                                                    },
+                                                                                          "governance":  {
+                                                                                                             "policy":  true,
+                                                                                                             "confirmToken":  true,
+                                                                                                             "redactions":  [
+                                                                                                                                "password",
+                                                                                                                                "credential",
+                                                                                                                                "email",
+                                                                                                                                "id",
+                                                                                                                                "bank",
+                                                                                                                                "phone"
+                                                                                                                            ],
+                                                                                                             "blockedResult":  true,
+                                                                                                             "inputRequiredResult":  true
+                                                                                                         }
                                                                                       },
                                                                      "serverInfo":  {
                                                                                         "name":  "swarm-desktop",
-                                                                                        "version":  "1.0.0"
+                                                                                        "version":  "1.0.0",
+                                                                                        "protocolVersions":  [
+                                                                                                                  "2024-11-05",
+                                                                                                                  "2025-06-18"
+                                                                                                              ]
                                                                                     },
                                                                      "instructions":  "Call task_begin first to obtain local user authorization. Coordinates are window-client CSS pixels returned by observe; elementId takes precedence. Screenshots are returned on task_begin and on explicit observe requests. The desktop never steals foreground: if an action returns needs_foreground, call focus first. Esc stops when the target is focused; Ctrl+Alt+Shift+Esc always stops."
                                                                  }
