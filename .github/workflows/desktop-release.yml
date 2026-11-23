@@ -30,8 +30,18 @@ jobs:
         run: dotnet restore SwarmDesktop.sln
 
       # 设计基线：Release 且 0 警告，任何警告都视为失败。
+      # 把编译错误转成 ::error 注解，公开仓库无需登录日志即可定位失败原因。
       - name: Build (Release, warnings as errors)
-        run: dotnet build SwarmDesktop.sln -c Release --no-restore -warnaserror
+        shell: pwsh
+        run: |
+          dotnet build SwarmDesktop.sln -c Release --no-restore -warnaserror 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content build.log |
+              Select-String -Pattern ': (error|warning) [A-Z]+[0-9]+' |
+              Select-Object -First 20 |
+              ForEach-Object { Write-Output "::error::$($_.Line.Trim())" }
+            exit 1
+          }
 
       # --no-build 确保测的就是上一步 Release 产物，而不是残留的 Debug 输出。
       - name: Test (Release)
