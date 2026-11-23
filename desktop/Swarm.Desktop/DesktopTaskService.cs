@@ -9,6 +9,7 @@ using Swarm.Core.Capture;
 using Swarm.Core.Diagnostics;
 using Swarm.Core.Governance;
 using Swarm.Core.Operations;
+using Swarm.Core.Perception;
 using Swarm.Core.Security;
 using Swarm.Core.Semantics;
 
@@ -54,6 +55,17 @@ public sealed class DesktopTaskService
     private readonly DispatcherTimer _mirrorPump = new();
     private readonly int _mirrorIntervalMs;
     private readonly SemaphoreSlim _mirrorGate = new(1, 1);  // 防止 encode 慢时 Pump 重入
+
+    // P2 OCR/SoM 视觉兜底: UIA 不可用时的降级通道.
+    // 当前默认 NullOcrService (IsAvailable=false), 未来注入 WinRtOcrService / Tesseract 实现.
+    private readonly IOcrService _ocrService = new NullOcrService();
+
+    private sealed class NullOcrService : IOcrService
+    {
+        public bool IsAvailable => false;
+        public Task<IReadOnlyList<OcrLine>> OcrAsync(RgbaFrame frame, CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<OcrLine>>(Array.Empty<OcrLine>());
+    }
 
     public DesktopTaskService(MainWindow host)
     {
@@ -382,6 +394,37 @@ public sealed class DesktopTaskService
             throw new DesktopOperationException("window_closed", error.Message);
         }
 
+        // P2 Fallback: UIA 不可用时走 OCR + SoM 视觉兜底.
+        string provenance = "uia";
+        string? fallbackReason = null;
+        List<SoMElement>? somElements = null;
+        if (snapshot == null && capture.Frame != null && !capture.Occluded)
+        {
+            var ocr = _ocrService;
+            if (ocr.IsAvailable)
+            {
+                try
+                {
+                    var lines = await ocr.OcrAsync(capture.Frame);
+                    if (lines.Count > 0)
+                    {
+                        provenance = "ocr";
+                        fallbackReason = "uia_unavailable";
+                        somElements = SetOfMarkBuilder.Build(lines).ToList();
+                        FileLog.Write("desktop", $"observe fallback OCR lines={lines.Count} somMarks={somElements.Count}");
+                    }
+                }
+                catch (Exception error)
+                {
+                    FileLog.Write("desktop", $"observe fallback OCR error: {error.Message}");
+                }
+            }
+            else
+            {
+                fallbackReason = "ocr_unavailable";
+            }
+        }
+
         if (progress != null) await progress.Report(0.55, "uia");
 
         var redactionOptions = _policy.EffectiveRedaction;
@@ -449,14 +492,14 @@ public sealed class DesktopTaskService
         object? screenshot = null;
         if (includeScreenshot)
         {
-            var frame = capture.Frame;
+            var frame = capture.Frame!;
             if (!redactionOptions.IsOff && !redactionOptions.IsMetadataOnly && hits.Length > 0)
             {
                 var regions = hits.Select(hit => hit.Bounds).ToArray();
-                frame = await Task.Run(() => RedactionRenderer.Mask(capture.Frame, clientScreen, regions));
+                frame = await Task.Run(() => RedactionRenderer.Mask(capture.Frame!, clientScreen, regions));
             }
             var max = _screenshotMax;
-            var image = await Task.Run(() => NativeImage.ToDataUrl(CaptureService.Scale(frame, max)));
+            var image = await Task.Run(() => NativeImage.ToDataUrl(CaptureService.Scale(frame!, max)));
             screenshot = new { mimeType = "image/png", data = image.Substring("data:image/png;base64,".Length) };
             if (progress != null) await progress.Report(0.85, "screenshot");
         }
@@ -512,6 +555,15 @@ public sealed class DesktopTaskService
             captureBackend = capture.Backend,
             frameAgeMs = capture.FrameAgeMs,
             warning,
+            // P2 OCR/SoM 视觉兜底元数据: 让 Agent 知道当前 grounding 通道和可信度.
+            provenance,                           // "uia" | "ocr"
+            fallbackReason,                       // null | "uia_unavailable" | "ocr_unavailable"
+            somMarks = somElements?.Select(m => new
+            {
+                markId = m.MarkId, text = m.Text, kind = m.Kind.ToString().ToLowerInvariant(),
+                bounds = new { x = m.X, y = m.Y, w = m.Width, h = m.Height },
+                confidence = m.Confidence,
+            }).ToArray(),
         };
     }
 
