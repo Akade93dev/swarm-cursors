@@ -7,4 +7,5 @@ desktop/**/bin/
 desktop/**/obj/
 desktop/publish/
 desktop/publish-verify/
+desktop/publish-smoke/
 desktop/TestResults/
