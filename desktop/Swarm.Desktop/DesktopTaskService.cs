@@ -56,15 +56,21 @@ public sealed class DesktopTaskService
     private readonly int _mirrorIntervalMs;
     private readonly SemaphoreSlim _mirrorGate = new(1, 1);  // 防止 encode 慢时 Pump 重入
 
-    // P2 OCR/SoM 视觉兜底: UIA 不可用时的降级通道.
-    // 当前默认 NullOcrService (IsAvailable=false), 未来注入 WinRtOcrService / Tesseract 实现.
-    private readonly IOcrService _ocrService = new NullOcrService();
+    // P2 OCR/SoM 视觉兜底: 优先 TesseractOcrService (TesseractOCR 5.5.1 内嵌 Native),
+    // tessdata 缺失时自动 fallback 到 NullOcrService (IsAvailable=false, 不 crash).
+    private readonly IOcrService _ocrService = ResolveOcrService();
+
+    private static IOcrService ResolveOcrService()
+    {
+        try { return new Swarm.Desktop.Perception.TesseractOcrService(); }
+        catch { return new NullOcrService(); }
+    }
 
     private sealed class NullOcrService : IOcrService
     {
         public bool IsAvailable => false;
         public Task<IReadOnlyList<OcrLine>> OcrAsync(RgbaFrame frame, CancellationToken ct)
-            => Task.FromResult<IReadOnlyList<OcrLine>>(Array.Empty<OcrLine>());
+            => Task.FromResult<IReadOnlyList<OcrLine>>(System.Array.Empty<OcrLine>());
     }
 
     public DesktopTaskService(MainWindow host)
