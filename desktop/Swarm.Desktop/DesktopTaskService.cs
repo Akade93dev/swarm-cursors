@@ -50,13 +50,21 @@ public sealed class DesktopTaskService
     private int _actionCount;
     private AuditContext _auditContext = new();
 
+    // P1-M Mirror 帧通道: 后台定时器周期性抓帧推给 renderer 做人类 mirror 展示.
+    private readonly DispatcherTimer _mirrorPump = new();
+    private readonly int _mirrorIntervalMs;
+    private readonly SemaphoreSlim _mirrorGate = new(1, 1);  // 防止 encode 慢时 Pump 重入
+
     public DesktopTaskService(MainWindow host)
     {
         _host = host;
         _visualLeadMs = ReadSetting("SWARM_VISUAL_LEAD_MS", 90, 0, 2000);
         _screenshotMax = ReadSetting("SWARM_SCREENSHOT_MAX", 1600, 320, 4096);
         _pixelDiffThreshold = ReadSetting("SWARM_PIXEL_DIFF_PERMILLE", 5, 1, 500) / 1000.0;
+        _mirrorIntervalMs = ReadSetting("SWARM_MIRROR_INTERVAL_MS", 200, 50, 2000);
         _watchdog.Tick += (_, _) => _ = CheckGatewayAsync();
+        _mirrorPump.Interval = TimeSpan.FromMilliseconds(_mirrorIntervalMs);
+        _mirrorPump.Tick += (_, _) => _ = PumpMirrorFrameAsync();
     }
 
     public bool IsActive
@@ -187,6 +195,7 @@ public sealed class DesktopTaskService
 
     public async Task StopLocalAsync(bool keepAudit = false)
     {
+        StopMirror();
         OperationRunner? operations;
         ActionCoordinator? coordinator;
         int generation;
@@ -317,6 +326,7 @@ public sealed class DesktopTaskService
         _host.ShowTaskOverlay(capture.Monitor, capture.DpiScale);
         _host.PostMessage(new { type = "task-status", text = $"已授权：{candidate.ProcessName}，目标在前台时 Esc 急停" });
         _watchdog.Start();
+        StartMirror();
         FileLog.Write("desktop", $"task begin pid={candidate.ProcessId} process={candidate.ProcessName} title={candidate.Title} capture={capture.Backend}");
         try
         {
@@ -1393,6 +1403,69 @@ public sealed class DesktopTaskService
                     });
                     break;
             }
+        }
+    }
+
+    // ──────────── P1-M Mirror 帧通道 ────────────
+
+    /// <summary>任务授权成功后启动: 周期性抓帧推给 renderer 做人类 mirror 展示.</summary>
+    private void StartMirror()
+    {
+        try { _mirrorPump.Start(); }
+        catch { /* 启动失败不影响任务主流程 */ }
+    }
+
+    /// <summary>任务停止时关闭 Mirror 帧通道.</summary>
+    private void StopMirror()
+    {
+        try
+        {
+            _mirrorPump.Stop();
+            _mirrorGate.Wait(TimeSpan.FromMilliseconds(500));
+        }
+        catch { /* 关闭失败静默 */ }
+    }
+
+    /// <summary>Mirror 帧 Pump: 抓帧 → 编码 → PostMessage 推给 renderer.
+    /// 脱敏在 renderer 侧用 redactions[] + human-mask.mjs 做 CSS blur, 省掉 Desktop 端的 GPU 读回后再 mask 的双重开销.</summary>
+    private async Task PumpMirrorFrameAsync()
+    {
+        if (!_mirrorGate.Wait(0)) return;  // 上一帧 encode 还没结束, 跳过这轮
+        try
+        {
+            TargetIdentity? identity;
+            lock (_sync)
+            {
+                if (_stopping || _target == null) return;
+                identity = _target;
+            }
+
+            var capture = await CaptureService.CaptureAsync(identity.Handle);
+            if (capture.Frame == null) return;
+            if (capture.Occluded) return;  // 遮挡帧跳过, 人类 mirror 应展示目标窗口内容
+
+            var frame = CaptureService.Scale(capture.Frame, _screenshotMax);
+            var dataUrl = NativeImage.ToDataUrl(frame);
+            var base64 = dataUrl.Substring("data:image/png;base64,".Length);
+
+            _host.PostMessage(new
+            {
+                type = "frame",
+                data = base64,
+                mimeType = "image/png",
+                width = frame.Width,
+                height = frame.Height,
+                frameAgeMs = capture.FrameAgeMs,
+                captureBackend = capture.Backend,
+            });
+        }
+        catch (Exception error)
+        {
+            FileLog.Write("desktop", $"mirror pump error: {error.Message}");
+        }
+        finally
+        {
+            _mirrorGate.Release();
         }
     }
 }

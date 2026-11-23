@@ -655,7 +655,34 @@ async function handle(message) {
     case "task-status": status(message.text, message.duration || 0); break;
     case "op-session": case "op-step": case "op-end": case "op-control": handleOps(message); break;
     case "status": status(message.text, message.duration || 2200); break;
+    case "frame": handleMirrorFrame(message); break;
   }
+}
+
+// ──────────── P1-M Mirror 帧通道: 人类 mirror 底层背景图替换 ────────────
+let mirrorBg = null;
+let mirrorMasks = [];
+
+function ensureMirrorBg() {
+  if (mirrorBg) return mirrorBg;
+  const img = document.createElement("img");
+  img.id = "mirror-bg";
+  img.setAttribute("referrerpolicy", "no-referrer");
+  // 透明 + 不抢焦点 + 最底层叠放 (z-index 0, 低于重建画面的 -1/-2 或 body 默认)
+  img.style.cssText = "position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;z-index:-1;pointer-events:none;opacity:0.92;filter:contrast(0.96);";
+  document.body.appendChild(img);
+  mirrorBg = img;
+  return mirrorBg;
+}
+
+function handleMirrorFrame(message) {
+  if (!message || !message.data) return;
+  const img = ensureMirrorBg();
+  // 只在 data 变化时替换 src (避免浏览器重复解码)
+  const newSrc = `data:${message.mimeType || "image/png"};base64,${message.data}`;
+  if (img.src !== newSrc) img.src = newSrc;
+  // redactions 在 observe 返回时已存于 model.items[0].structuredContent.redactions,
+  // 后续迭代里 human-mask.mjs 在此处叠加 CSS blur + 类别角标.
 }
 
 if (bridge()) bridge().addEventListener("message", (event) => handle(event.data).catch((error) => post({ type: "renderer-error", error: String(error) })));
