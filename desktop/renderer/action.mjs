@@ -22,6 +22,8 @@ export function normalizeAction(action, viewportWidth, viewportHeight) {
     deltaY: Number(action.deltaY) || 0,
     label: action.sensitive ? "输入受保护文本" : String(action.label || action.kind || "AI 操作").slice(0, 160),
     sensitive: Boolean(action.sensitive),
+    // P1-M: intent = "为什么做"。默认空(旧事件不带), 截断到 140 字符。
+    intent: action.intent != null ? String(action.intent).slice(0, 140) : "",
   };
 }
 
@@ -48,6 +50,7 @@ export function replayActionFrame(action) {
       cursorY: Number(action.cursorY) || 0,
       label: action.sensitive ? "输入受保护文本" : String(action.label || "AI 操作").slice(0, 160),
       sensitive: Boolean(action.sensitive),
+      intent: action.intent != null ? String(action.intent).slice(0, 140) : "",
     },
   };
 }

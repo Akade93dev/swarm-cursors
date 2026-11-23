@@ -44,6 +44,9 @@ export function applyOpsEvent(state, message) {
         id,
         kind: String(raw.kind || "custom"),
         label: String(raw.label || "AI 操作").slice(0, 120),
+        // intent: "为什么做"——P1-M mirror 人类通道需要的三要素之一(计划→动作→证据)。
+        // 可为空(旧事件不带), 截断到 140 字符。
+        intent: raw.intent != null ? String(raw.intent).slice(0, 140) : "",
         status: STATUS_ALIASES[raw.status] || String(raw.status || "pending"),
         ms: Math.max(0, Number(raw.ms) || 0),
         error: raw.error ? String(raw.error).slice(0, 120) : "",
