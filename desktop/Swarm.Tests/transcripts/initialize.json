@@ -1,0 +1,79 @@
+{
+    "name":  "initialize-handshake",
+    "steps":  [
+                  {
+                      "send":  {
+                                   "method":  "initialize",
+                                   "params":  {
+                                                  "clientInfo":  {
+                                                                     "version":  "1.0",
+                                                                     "name":  "golden"
+                                                                 },
+                                                  "protocolVersion":  "2024-11-05",
+                                                  "capabilities":  {
+
+                                                                   }
+                                              },
+                                   "id":  1,
+                                   "jsonrpc":  "2.0"
+                               },
+                      "expect":  {
+                                     "response":  {
+                                                      "jsonrpc":  "2.0",
+                                                      "id":  1,
+                                                      "result":  {
+                                                                     "protocolVersion":  "2024-11-05",
+                                                                     "capabilities":  {
+                                                                                          "tools":  {
+                                                                                                        "listChanged":  false
+                                                                                                    }
+                                                                                      },
+                                                                     "serverInfo":  {
+                                                                                        "name":  "swarm-desktop",
+                                                                                        "version":  "1.0.0"
+                                                                                    },
+                                                                     "instructions":  "Call task_begin first to obtain local user authorization. Coordinates are window-client CSS pixels returned by observe; elementId takes precedence. Screenshots are returned on task_begin and on explicit observe requests. The desktop never steals foreground: if an action returns needs_foreground, call focus first. Esc stops when the target is focused; Ctrl+Alt+Shift+Esc always stops."
+                                                                 }
+                                                  }
+                                 }
+                  },
+                  {
+                      "send":  {
+                                   "method":  "notifications/initialized",
+                                   "jsonrpc":  "2.0"
+                               },
+                      "expect":  {
+
+                                 }
+                  },
+                  {
+                      "send":  {
+                                   "method":  "initialize",
+                                   "params":  {
+                                                  "protocolVersion":  "2099-01-01"
+                                              },
+                                   "id":  2,
+                                   "jsonrpc":  "2.0"
+                               },
+                      "expect":  {
+                                     "response":  {
+                                                      "jsonrpc":  "2.0",
+                                                      "id":  2,
+                                                      "result":  {
+                                                                     "protocolVersion":  "2024-11-05",
+                                                                     "capabilities":  {
+                                                                                          "tools":  {
+                                                                                                        "listChanged":  false
+                                                                                                    }
+                                                                                      },
+                                                                     "serverInfo":  {
+                                                                                        "name":  "swarm-desktop",
+                                                                                        "version":  "1.0.0"
+                                                                                    },
+                                                                     "instructions":  "Call task_begin first to obtain local user authorization. Coordinates are window-client CSS pixels returned by observe; elementId takes precedence. Screenshots are returned on task_begin and on explicit observe requests. The desktop never steals foreground: if an action returns needs_foreground, call focus first. Esc stops when the target is focused; Ctrl+Alt+Shift+Esc always stops."
+                                                                 }
+                                                  }
+                                 }
+                  }
+              ]
+}

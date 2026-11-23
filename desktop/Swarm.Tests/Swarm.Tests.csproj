@@ -21,6 +21,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Update="transcripts\**\*.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Swarm.Core\Swarm.Core.csproj" />
     <ProjectReference Include="..\Swarm.Gateway\Swarm.Gateway.csproj" />
   </ItemGroup>

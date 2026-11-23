@@ -1,3 +1,5 @@
+using Swarm.Core.Capture;
+using Swarm.Core.Semantics;
 using Swarm.Core.Visual;
 
 namespace Swarm.Tests;
@@ -181,5 +183,96 @@ public class FontMetricFitterTests
     public void ClassifyWeight_UsesStrokeToXHeightRatio(double ratio, int expected)
     {
         Assert.Equal(expected, FontMetricFitter.ClassifyWeight(ratio));
+    }
+
+    [Theory]
+    [InlineData(0.7, 300)]   // 笔画比 ≈0.10 → Light
+    [InlineData(1.05, 400)]  // 笔画比 ≈0.15 → Regular
+    [InlineData(2.1, 700)]   // 笔画比 ≈0.30 → Bold
+    public void Fit_WithFamilyPinned_PicksCorrectWeight(double stroke, int expectedWeight)
+    {
+        // 同族（Segoe UI）三档字重候选，字号/高度度量固定相同，字重只能由笔画比先验决定；
+        // 同时验证 "Segoe UI Light" 被 IsUiFamily 免罚，否则 300 档会被 OtherFacePenalty 不公平压过。
+        var probe = new FontProbe(900, 70, 50, 74, 23);
+        var fitter = Fitter(
+            (("Segoe UI Light", 300, false), probe),
+            (("Segoe UI", 400, false), probe),
+            (("Segoe UI", 700, false), probe));
+
+        var result = fitter.Fit(
+            new FontFitRequest("Workspace settings", 126, 11, stroke, 1),
+            new[]
+            {
+                new FontCandidate("Segoe UI Light", 300, false),
+                new FontCandidate("Segoe UI", 400, false),
+                new FontCandidate("Segoe UI", 700, false),
+            });
+
+        Assert.NotNull(result);
+        Assert.Equal(expectedWeight, result!.Weight);
+        Assert.True(result.Confidence > 0.15, $"confidence={result.Confidence}");
+    }
+
+    [Theory]
+    [InlineData(1.0, 300)]  // ratio≈0.095 → Light
+    [InlineData(2.0, 400)]  // ratio≈0.190 → Regular
+    [InlineData(3.0, 700)]  // ratio≈0.286 → Bold
+    public void ClassifyWeightFromInk_PicksWeightByStrokeRatio(double stroke, int expected)
+    {
+        // 14css px @ 150% DPI：scale=0.21，XHeight=50 → 分母 10.5，stroke=1/2/3 对应三档。
+        var fitter = Fitter((("Segoe UI", 400, false), new FontProbe(900, 70, 50, 74, 23)));
+        var weight = fitter.ClassifyWeightFromInk("Workspace settings", "Segoe UI", stroke, 14, 1.5);
+        Assert.Equal(expected, weight);
+    }
+
+    [Fact]
+    public void ClassifyWeightFromInk_DoesNotReturnLightForFamiliesWithoutLightVariant()
+    {
+        // 非 Segoe UI 没有 Light 候选，即使笔画很细也归 Regular，避免渲染层写 300 却无对应字形。
+        var fitter = Fitter((("Arial", 400, false), new FontProbe(900, 70, 50, 74, 23)));
+        var weight = fitter.ClassifyWeightFromInk("Settings", "Arial", 1.0, 14, 1.5);
+        Assert.Equal(400, weight);
+    }
+
+    [Fact]
+    public void ClassifyWeightFromInk_ReturnsNullWhenProbeMissingOrStrokeInvalid()
+    {
+        var empty = Fitter();
+        Assert.Null(empty.ClassifyWeightFromInk("Settings", "Missing Font", 1.0, 14, 1.5));
+        var fitter = Fitter((("Segoe UI", 400, false), new FontProbe(900, 70, 50, 74, 23)));
+        Assert.Null(fitter.ClassifyWeightFromInk("Settings", "Segoe UI", 0, 14, 1.5));
+        Assert.Null(fitter.ClassifyWeightFromInk("", "Segoe UI", 1.0, 14, 1.5));
+    }
+
+    [Theory]
+    [InlineData(1, 300)]
+    [InlineData(2, 400)]
+    [InlineData(3, 700)]
+    public void ClassifyWeightFromInk_FrameRegion_UsesMeasuredStroke(int stroke, int expected)
+    {
+        // 主路径只有区域截图，没有现成笔画宽；用两条指定宽度的竖笔画验证完整取像素链路。
+        var frame = new RgbaFrame(60, 30, Enumerable.Repeat((byte)255, 60 * 30 * 4).ToArray());
+        for (var y = 5; y < 25; y++)
+        for (var x = 10; x < 10 + stroke; x++)
+        for (var offset = 0; offset <= 14; offset += 14)
+        {
+            var index = (y * frame.Width + x + offset) * 4;
+            frame.Pixels[index] = 0;
+            frame.Pixels[index + 1] = 0;
+            frame.Pixels[index + 2] = 0;
+        }
+        var fitter = Fitter((("Segoe UI", 400, false), new FontProbe(900, 70, 50, 74, 23)));
+
+        var weight = fitter.ClassifyWeightFromInk(
+            frame,
+            new RectInt(0, 0, 60, 30),
+            new Rgb(255, 255, 255),
+            0,
+            "Workspace settings",
+            "Segoe UI",
+            14,
+            1.5);
+
+        Assert.Equal(expected, weight);
     }
 }

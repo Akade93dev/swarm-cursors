@@ -1,0 +1,41 @@
+{
+  "name": "tool-call-error",
+  "transport": {
+    "error": {
+      "code": "authorization_denied",
+      "message": "The local user denied authorization."
+    }
+  },
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": "denied",
+        "method": "tools/call",
+        "params": {
+          "name": "task_begin",
+          "arguments": {}
+        }
+      },
+      "expect": {
+        "response": {
+          "jsonrpc": "2.0",
+          "id": "denied",
+          "result": {
+            "structuredContent": {
+              "error": {
+                "code": "authorization_denied",
+                "reason": null,
+                "message": "The local user denied authorization."
+              }
+            },
+            "content": [
+              {"type":"text","text":"{\"error\":{\"code\":\"authorization_denied\",\"reason\":null,\"message\":\"The local user denied authorization.\"}}"}
+            ],
+            "isError": true
+          }
+        }
+      }
+    }
+  ]
+}

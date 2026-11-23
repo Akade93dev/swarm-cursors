@@ -1,0 +1,31 @@
+{
+  "name": "tool-call-success",
+  "transport": {
+    "result": {"token":"t1","accepted":true}
+  },
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": "call-1",
+        "method": "tools/call",
+        "params": {
+          "name": "task_begin",
+          "arguments": {"targetProcess":"notepad"}
+        }
+      },
+      "expect": {
+        "response": {
+          "jsonrpc": "2.0",
+          "id": "call-1",
+          "result": {
+            "structuredContent": {"token":"t1","accepted":true},
+            "content": [
+              {"type":"text","text":"{\"token\":\"t1\",\"accepted\":true}"}
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

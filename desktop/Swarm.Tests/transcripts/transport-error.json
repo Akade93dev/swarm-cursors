@@ -1,0 +1,35 @@
+{
+  "name": "transport-error",
+  "transport": {
+    "throw": "Desktop pipe is unavailable."
+  },
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": "broken",
+        "method": "tools/call",
+        "params": {"name":"observe","arguments":{"token":"t1"}}
+      },
+      "expect": {
+        "response": {
+          "jsonrpc": "2.0",
+          "id": "broken",
+          "result": {
+            "structuredContent": {
+              "error": {
+                "code": "desktop_transport_error",
+                "reason": null,
+                "message": "Desktop pipe is unavailable."
+              }
+            },
+            "content": [
+              {"type":"text","text":"{\"error\":{\"code\":\"desktop_transport_error\",\"reason\":null,\"message\":\"Desktop pipe is unavailable.\"}}"}
+            ],
+            "isError": true
+          }
+        }
+      }
+    }
+  ]
+}

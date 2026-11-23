@@ -1,0 +1,829 @@
+{
+  "name": "tools-list",
+  "steps": [
+    {
+      "send": {
+        "method": "tools/list",
+        "params": {},
+        "id": 3,
+        "jsonrpc": "2.0"
+      },
+      "expect": {
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "tools": [
+              {
+                "name": "task_begin",
+                "description": "Begin a desktop task and obtain local user authorization; this must succeed before other tools are used. Pass policy to restrict processes/titles, enforce read-only, cap actions and duration, deny or confirm cross-app actions, and redact sensitive regions.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "targetProcess": {
+                      "type": "string",
+                      "description": "Optional target process name."
+                    },
+                    "targetTitle": {
+                      "type": "string",
+                      "description": "Optional target window title."
+                    },
+                    "policy": {
+                      "type": "object",
+                      "description": "Optional governance policy. Defaults are conservative: cross-app actions are denied, destructive/external actions require a confirmToken, and sensitive regions are masked.",
+                      "properties": {
+                        "allowedProcesses": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          },
+                          "description": "Process names permitted for this task."
+                        },
+                        "allowedTitles": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          },
+                          "description": "Window title fragments permitted for this task."
+                        },
+                        "readOnly": {
+                          "type": "boolean",
+                          "description": "Deny every action that changes the target."
+                        },
+                        "maxActions": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 10000,
+                          "description": "Maximum executed actions."
+                        },
+                        "maxDurationMs": {
+                          "type": "integer",
+                          "minimum": 1000,
+                          "maximum": 86400000,
+                          "description": "Maximum task duration in milliseconds."
+                        },
+                        "allowCrossApp": {
+                          "type": "boolean",
+                          "description": "Allow actions on elements owned by other processes."
+                        },
+                        "requireConfirmFor": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          },
+                          "description": "Action categories that require a confirmToken: submit, delete, send, purchase, cross_app. An empty array disables confirmation."
+                        },
+                        "redaction": {
+                          "type": "object",
+                          "properties": {
+                            "mode": {
+                              "type": "string",
+                              "enum": [
+                                "mask",
+                                "metadata",
+                                "off"
+                              ],
+                              "description": "mask redacts text and pixels; metadata redacts text only; off disables redaction."
+                            },
+                            "categories": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              },
+                              "description": "Sensitive categories to redact: password, credential, email, id, bank, phone. Empty means all."
+                            }
+                          },
+                          "additionalProperties": false
+                        }
+                      },
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [],
+                  "additionalProperties": false
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "target": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "viewport": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "capabilities": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "window": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "generation": {
+                      "type": "integer"
+                    },
+                    "elements": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "redactions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "screenshot": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "occluded": {
+                      "type": "boolean"
+                    },
+                    "captureBackend": {
+                      "type": "string"
+                    },
+                    "frameAgeMs": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "warning": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": false,
+                  "idempotentHint": false,
+                  "openWorldHint": true
+                }
+              },
+              {
+                "name": "observe",
+                "description": "Observe the authorized window and return elements, window-client CSS geometry, occlusion state, and target capabilities. If capabilities.messageReliable is false (Chromium/Electron), actions on a non-foreground window return needs_foreground with reason app_ignores_message; call focus first. Set includeScreenshot to receive a PNG.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "Task token returned by task_begin."
+                    },
+                    "includeScreenshot": {
+                      "type": "boolean",
+                      "description": "Return a PNG screenshot scaled to at most 1600 px."
+                    }
+                  },
+                  "required": [
+                    "token"
+                  ],
+                  "additionalProperties": false
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "target": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "viewport": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "capabilities": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "window": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "generation": {
+                      "type": "integer"
+                    },
+                    "elements": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "redactions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "screenshot": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "occluded": {
+                      "type": "boolean"
+                    },
+                    "captureBackend": {
+                      "type": "string"
+                    },
+                    "frameAgeMs": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "warning": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "annotations": {
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": true
+                }
+              },
+              {
+                "name": "click",
+                "description": "Click in the authorized task. elementId takes precedence over coordinates; x and y are window-client CSS coordinates returned by observe. If the target ignores window messages (see observe.capabilities), call focus first. Set observe to refresh the view in the same call.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "Task token."
+                    },
+                    "elementId": {
+                      "type": "string",
+                      "description": "Preferred observed element id."
+                    },
+                    "x": {
+                      "type": "number",
+                      "description": "Window-client CSS x coordinate."
+                    },
+                    "y": {
+                      "type": "number",
+                      "description": "Window-client CSS y coordinate."
+                    },
+                    "label": {
+                      "type": "string",
+                      "description": "Optional click label."
+                    },
+                    "verify": {
+                      "type": "string",
+                      "description": "Set pixels to confirm the click with a stable before/after pixel diff of the element or click region."
+                    },
+                    "observe": {
+                      "type": "boolean",
+                      "description": "Return a fresh observation after the click."
+                    },
+                    "confirmToken": {
+                      "type": "string",
+                      "description": "One-time token returned by needs_confirmation for this exact action."
+                    }
+                  },
+                  "required": [
+                    "token"
+                  ],
+                  "additionalProperties": false
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "executed": {
+                      "type": "boolean"
+                    },
+                    "actionId": {
+                      "type": "string"
+                    },
+                    "tier": {
+                      "type": "string"
+                    },
+                    "verified": {
+                      "type": "boolean"
+                    },
+                    "evidence": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "note": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "foregroundUnchanged": {
+                      "type": "boolean"
+                    },
+                    "foregroundRestored": {
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "confirmToken": {
+                      "type": "string"
+                    },
+                    "summary": {
+                      "type": "string"
+                    },
+                    "expiresInMs": {
+                      "type": "integer"
+                    },
+                    "observation": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": true,
+                  "idempotentHint": false,
+                  "openWorldHint": true
+                }
+              },
+              {
+                "name": "type_text",
+                "description": "Type text into the authorized task, preferably at elementId. Set sensitive for secrets. If the target ignores window messages (see observe.capabilities), call focus first.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "Task token."
+                    },
+                    "text": {
+                      "type": "string",
+                      "description": "Text to type."
+                    },
+                    "sensitive": {
+                      "type": "boolean",
+                      "description": "Whether the text is sensitive."
+                    },
+                    "elementId": {
+                      "type": "string",
+                      "description": "Preferred observed element id."
+                    },
+                    "verify": {
+                      "type": "string",
+                      "description": "Set pixels to confirm typing with a stable before/after pixel diff; requires elementId."
+                    },
+                    "observe": {
+                      "type": "boolean",
+                      "description": "Return a fresh observation after typing."
+                    },
+                    "confirmToken": {
+                      "type": "string",
+                      "description": "One-time token returned by needs_confirmation for this exact action."
+                    }
+                  },
+                  "required": [
+                    "token",
+                    "text"
+                  ],
+                  "additionalProperties": false
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "executed": {
+                      "type": "boolean"
+                    },
+                    "actionId": {
+                      "type": "string"
+                    },
+                    "tier": {
+                      "type": "string"
+                    },
+                    "verified": {
+                      "type": "boolean"
+                    },
+                    "evidence": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "note": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "foregroundUnchanged": {
+                      "type": "boolean"
+                    },
+                    "foregroundRestored": {
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "confirmToken": {
+                      "type": "string"
+                    },
+                    "summary": {
+                      "type": "string"
+                    },
+                    "expiresInMs": {
+                      "type": "integer"
+                    },
+                    "observation": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": true,
+                  "idempotentHint": false,
+                  "openWorldHint": true
+                }
+              },
+              {
+                "name": "press_key",
+                "description": "Press a key or key chord in the authorized task. If the target ignores window messages (see observe.capabilities), call focus first.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "Task token."
+                    },
+                    "key": {
+                      "type": "string",
+                      "description": "Key or key chord."
+                    },
+                    "verify": {
+                      "type": "string",
+                      "description": "Set pixels to confirm the key with a stable before/after pixel diff of the client area."
+                    },
+                    "observe": {
+                      "type": "boolean",
+                      "description": "Return a fresh observation after the key."
+                    },
+                    "confirmToken": {
+                      "type": "string",
+                      "description": "One-time token returned by needs_confirmation for this exact action."
+                    }
+                  },
+                  "required": [
+                    "token",
+                    "key"
+                  ],
+                  "additionalProperties": false
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "executed": {
+                      "type": "boolean"
+                    },
+                    "actionId": {
+                      "type": "string"
+                    },
+                    "tier": {
+                      "type": "string"
+                    },
+                    "verified": {
+                      "type": "boolean"
+                    },
+                    "evidence": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "note": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "foregroundUnchanged": {
+                      "type": "boolean"
+                    },
+                    "foregroundRestored": {
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "confirmToken": {
+                      "type": "string"
+                    },
+                    "summary": {
+                      "type": "string"
+                    },
+                    "expiresInMs": {
+                      "type": "integer"
+                    },
+                    "observation": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": true,
+                  "idempotentHint": false,
+                  "openWorldHint": true
+                }
+              },
+              {
+                "name": "scroll",
+                "description": "Scroll at window-client CSS coordinates x and y by delta in the authorized task. If the target ignores window messages (see observe.capabilities), call focus first.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "Task token."
+                    },
+                    "x": {
+                      "type": "number",
+                      "description": "Window-client CSS x coordinate."
+                    },
+                    "y": {
+                      "type": "number",
+                      "description": "Window-client CSS y coordinate."
+                    },
+                    "delta": {
+                      "type": "number",
+                      "description": "Scroll delta."
+                    },
+                    "verify": {
+                      "type": "string",
+                      "description": "Set pixels to confirm scrolling with a stable before/after pixel diff of the client area."
+                    },
+                    "observe": {
+                      "type": "boolean",
+                      "description": "Return a fresh observation after scrolling."
+                    },
+                    "confirmToken": {
+                      "type": "string",
+                      "description": "One-time token returned by needs_confirmation for this exact action."
+                    }
+                  },
+                  "required": [
+                    "token",
+                    "x",
+                    "y",
+                    "delta"
+                  ],
+                  "additionalProperties": false
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "executed": {
+                      "type": "boolean"
+                    },
+                    "actionId": {
+                      "type": "string"
+                    },
+                    "tier": {
+                      "type": "string"
+                    },
+                    "verified": {
+                      "type": "boolean"
+                    },
+                    "evidence": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "note": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "foregroundUnchanged": {
+                      "type": "boolean"
+                    },
+                    "foregroundRestored": {
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "confirmToken": {
+                      "type": "string"
+                    },
+                    "summary": {
+                      "type": "string"
+                    },
+                    "expiresInMs": {
+                      "type": "integer"
+                    },
+                    "observation": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": false,
+                  "idempotentHint": false,
+                  "openWorldHint": true
+                }
+              },
+              {
+                "name": "focus",
+                "description": "Explicitly bring the authorized target window to the foreground. Only needed when an action returns needs_foreground.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "Task token."
+                    },
+                    "observe": {
+                      "type": "boolean",
+                      "description": "Return a fresh observation after focusing."
+                    },
+                    "confirmToken": {
+                      "type": "string",
+                      "description": "One-time token returned by needs_confirmation for this exact action."
+                    }
+                  },
+                  "required": [
+                    "token"
+                  ],
+                  "additionalProperties": false
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "executed": {
+                      "type": "boolean"
+                    },
+                    "actionId": {
+                      "type": "string"
+                    },
+                    "tier": {
+                      "type": "string"
+                    },
+                    "verified": {
+                      "type": "boolean"
+                    },
+                    "evidence": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "note": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "foregroundUnchanged": {
+                      "type": "boolean"
+                    },
+                    "foregroundRestored": {
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "confirmToken": {
+                      "type": "string"
+                    },
+                    "summary": {
+                      "type": "string"
+                    },
+                    "expiresInMs": {
+                      "type": "integer"
+                    },
+                    "observation": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": true
+                }
+              },
+              {
+                "name": "task_end",
+                "description": "End the authorized desktop task normally.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "Task token."
+                    }
+                  },
+                  "required": [
+                    "token"
+                  ],
+                  "additionalProperties": false
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "stopped": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                }
+              },
+              {
+                "name": "task_stop",
+                "description": "Stop the authorized desktop task immediately. The local user can press Esc for emergency stop.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "Task token."
+                    }
+                  },
+                  "required": [
+                    "token"
+                  ],
+                  "additionalProperties": false
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "stopped": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

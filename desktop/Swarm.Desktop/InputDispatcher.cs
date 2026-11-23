@@ -7,7 +7,13 @@ using Swarm.Core.Semantics;
 
 namespace Swarm.Desktop;
 
-public sealed record ActionOutcome(InputTier Tier, bool Verified, string? Note = null, string? Evidence = null);
+public sealed record ActionOutcome(
+    InputTier Tier,
+    bool Verified,
+    string? Note = null,
+    string? Evidence = null,
+    bool ForegroundUnchanged = true,
+    bool ForegroundRestored = false);
 
 /// <summary>
 /// 分级输入：
@@ -50,6 +56,8 @@ public static class InputDispatcher
             var foregroundBefore = NativeMethods.GetForegroundWindow();
             try
             {
+                if (await Task.Run(() => TryNativeClick(element), cancellationToken))
+                    return UiaOutcome(window, foregroundBefore, "已用原生 UIA（AutoSetFocus=false）");
                 if (element.TryGetCurrentPattern(InvokePattern.Pattern, out var invoke))
                 {
                     await Task.Run(() => ((InvokePattern)invoke).Invoke(), cancellationToken);
@@ -65,10 +73,21 @@ public static class InputDispatcher
                     await Task.Run(() => ((SelectionItemPattern)selection).Select(), cancellationToken);
                     return UiaOutcome(window, foregroundBefore, null);
                 }
+                if (element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var expand))
+                {
+                    // 组合框/树节点/折叠面板：按当前状态做一次与真实点击等价的展开或收起。
+                    var pattern = (ExpandCollapsePattern)expand;
+                    await Task.Run(() =>
+                    {
+                        if (pattern.Current.ExpandCollapseState == ExpandCollapseState.Expanded) pattern.Collapse();
+                        else pattern.Expand();
+                    }, cancellationToken);
+                    return UiaOutcome(window, foregroundBefore, null);
+                }
             }
-            catch (ElementNotAvailableException)
+            catch (Exception error) when (IsUnavailable(error))
             {
-                // 元素在观察后失效，退回坐标路径并如实标记未验证。
+                // 元素在观察后失效或提供程序拒绝该模式，退回坐标路径并如实标记未验证。
                 RestoreForeground(window, foregroundBefore);
             }
         }
@@ -116,6 +135,8 @@ public static class InputDispatcher
             var foregroundBefore = NativeMethods.GetForegroundWindow();
             try
             {
+                if (await Task.Run(() => TryNativeSetValue(element, text), cancellationToken))
+                    return UiaOutcome(window, foregroundBefore, "已用原生 UIA（AutoSetFocus=false）");
                 if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var value))
                 {
                     var pattern = (ValuePattern)value;
@@ -124,8 +145,9 @@ public static class InputDispatcher
                     return UiaOutcome(window, foregroundBefore, null);
                 }
             }
-            catch (ElementNotAvailableException)
+            catch (Exception error) when (IsUnavailable(error))
             {
+                // 提供程序拒绝 SetValue（异常时未发生写入），退回消息/真实键盘路径。
                 RestoreForeground(window, foregroundBefore);
             }
         }
@@ -200,7 +222,7 @@ public static class InputDispatcher
         return Task.FromResult(new ActionOutcome(InputTier.Input, false, "使用真实键盘输入"));
     }
 
-    public static Task<ActionOutcome> ScrollAsync(
+    public static async Task<ActionOutcome> ScrollAsync(
         nint window,
         UiaSnapshot? snapshot,
         int screenX,
@@ -211,6 +233,8 @@ public static class InputDispatcher
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (!double.IsFinite(delta) || Math.Abs(delta) > 1200) throw new ArgumentOutOfRangeException(nameof(delta));
+        var uia = await TryUiaScrollAsync(window, screenX, screenY, (int)delta, cancellationToken);
+        if (uia != null) return uia;
         if (!IsForeground(window))
         {
             if (!MessagesReliable(snapshot))
@@ -221,7 +245,7 @@ public static class InputDispatcher
             cancellationToken.ThrowIfCancellationRequested();
             var wParam = (nint)((long)(delta & 0xFFFF) << 16);
             NativeMethods.PostMessage(target.Value.Handle, WmMouseWheel, wParam, MakeLParam(screenX, screenY));
-            return Task.FromResult(new ActionOutcome(InputTier.Message, false, "已向目标子窗口投递滚轮；部分应用会忽略消息输入"));
+            return new ActionOutcome(InputTier.Message, false, "已向目标子窗口投递滚轮；部分应用会忽略消息输入");
         }
 
         if (!allowForegroundInput)
@@ -232,7 +256,62 @@ public static class InputDispatcher
         NativeMethods.SetCursorPos(screenX, screenY);
         cancellationToken.ThrowIfCancellationRequested();
         Send(new[] { MouseInput(0x0800, delta) });
-        return Task.FromResult(new ActionOutcome(InputTier.Input, false, "使用真实滚轮输入"));
+        return new ActionOutcome(InputTier.Input, false, "使用真实滚轮输入");
+    }
+
+    /// <summary>
+    /// A 级滚动：指针下的元素或最近的可滚动祖先支持 ScrollPattern 时直接滚动，
+    /// 不动光标、不激活窗口，因此被遮挡时也能用。找不到可滚动容器则返回 null 交给 B/C 级。
+    /// </summary>
+    private static async Task<ActionOutcome?> TryUiaScrollAsync(
+        nint window,
+        int screenX,
+        int screenY,
+        int delta,
+        CancellationToken cancellationToken)
+    {
+        if (delta == 0) return null;
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromMilliseconds(400));
+            return await Task.Run(() => UiaScroll(window, screenX, screenY, delta), timeout.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+        catch (Exception error) when (IsUnavailable(error))
+        {
+            return null;
+        }
+    }
+
+    private static ActionOutcome? UiaScroll(nint window, int screenX, int screenY, int delta)
+    {
+        // 指针下不是目标窗口（被遮挡）时，FromPoint 会命中别的应用，不能拿它的滚动容器代劳。
+        var under = NativeMethods.WindowFromPoint(new NativeMethods.Win32Point { X = screenX, Y = screenY });
+        if (RootOf(under) != RootOf(window)) return null;
+
+        var element = AutomationElement.FromPoint(new System.Windows.Point(screenX, screenY));
+        for (var depth = 0; depth < 5 && element != null; depth++)
+        {
+            if (element.TryGetCurrentPattern(ScrollPattern.Pattern, out var found))
+            {
+                var scroll = (ScrollPattern)found;
+                if (scroll.Current.VerticallyScrollable)
+                {
+                    var foregroundBefore = NativeMethods.GetForegroundWindow();
+                    var amount = delta < 0 ? ScrollAmount.SmallDecrement : ScrollAmount.SmallIncrement;
+                    // 滚轮一格按控件小步长折算；UIA 没有像素级滚动。
+                    var steps = Math.Max(1, Math.Abs(delta) / 120);
+                    for (var i = 0; i < steps; i++) scroll.Scroll(amount, ScrollAmount.NoAmount);
+                    return UiaOutcome(window, foregroundBefore, "已用 UIA ScrollPattern 滚动；幅度按控件小步长折算");
+                }
+            }
+            element = TreeWalker.ControlViewWalker.GetParent(element);
+        }
+        return null;
     }
 
     public static ActionOutcome Focus(nint window)
@@ -250,14 +329,82 @@ public static class InputDispatcher
         return NativeMethods.GetAncestor(foreground, GaRoot) == NativeMethods.GetAncestor(window, GaRoot);
     }
 
+    private static bool TryNativeClick(AutomationElement element)
+    {
+        try
+        {
+            var bounds = element.Current.BoundingRectangle;
+            if (bounds.IsEmpty) return false;
+            var runtimeId = element.GetRuntimeId();
+            using var session = NativeUiaSession.TryCreate();
+            if (session == null) return false;
+            var native = session.ResolveFromPoint(
+                (int)(bounds.Left + bounds.Width / 2),
+                (int)(bounds.Top + bounds.Height / 2),
+                runtimeId);
+            if (native == 0) return false;
+            try
+            {
+                return session.TryClick(native);
+            }
+            finally
+            {
+                session.Release(native);
+            }
+        }
+        catch (Exception error) when (IsUnavailable(error))
+        {
+            return false;
+        }
+    }
+
+    private static bool TryNativeSetValue(AutomationElement element, string text)
+    {
+        try
+        {
+            var bounds = element.Current.BoundingRectangle;
+            if (bounds.IsEmpty) return false;
+            var runtimeId = element.GetRuntimeId();
+            using var session = NativeUiaSession.TryCreate();
+            if (session == null) return false;
+            var native = session.ResolveFromPoint(
+                (int)(bounds.Left + bounds.Width / 2),
+                (int)(bounds.Top + bounds.Height / 2),
+                runtimeId);
+            if (native == 0) return false;
+            try
+            {
+                return session.TrySetValue(native, text);
+            }
+            finally
+            {
+                session.Release(native);
+            }
+        }
+        catch (Exception error) when (IsUnavailable(error))
+        {
+            return false;
+        }
+    }
+
     private static ActionOutcome UiaOutcome(nint window, nint foregroundBefore, string? note)
     {
-        // 部分 UIA 提供程序（如 WinForms 文本框）在执行模式时会顺带 SetFocus，
-        // 把目标窗口推到前台；这里恢复动作前的前台窗口，保证“不抢前台”的承诺。
-        var restored = RestoreForeground(window, foregroundBefore);
-        if (!restored) return new ActionOutcome(InputTier.Uia, true, "UIA 动作可能改变了前台窗口，且未能恢复");
-        return new ActionOutcome(InputTier.Uia, true, note);
+        // 部分 UIA 提供程序（如 WinForms 文本框）在执行模式时会顺带 SetFocus，把目标窗口推到前台。
+        // 托管 UIA 客户端不暴露 AutoSetFocus，这里先度量是否真的发生切换，再恢复动作前的前台，
+        // 并把"是否未变 / 是否恢复过"如实带回调用方，不把发生过抢焦点的事实藏起来。
+        var windowRoot = RootOf(window);
+        var beforeRoot = RootOf(foregroundBefore);
+        var afterRoot = RootOf(NativeMethods.GetForegroundWindow());
+        RestoreForeground(window, foregroundBefore);
+        var restoredRoot = RootOf(NativeMethods.GetForegroundWindow());
+        var guard = ForegroundGuard.Evaluate(beforeRoot, afterRoot, windowRoot, restoredRoot);
+        var effectiveNote = guard.Unchanged
+            ? guard.Restored ? "UIA 动作曾把目标推到前台，已恢复原前台" : note
+            : "UIA 动作改变了前台窗口，且未能恢复";
+        return new ActionOutcome(InputTier.Uia, true, effectiveNote, null, guard.Unchanged, guard.Restored);
     }
+
+    private static nint RootOf(nint window) => window == 0 ? 0 : NativeMethods.GetAncestor(window, GaRoot);
 
     private static bool RestoreForeground(nint window, nint foregroundBefore)
     {
@@ -516,13 +663,13 @@ public static class InputDispatcher
     private static Input KeyboardInput(ushort key, uint flags) => new()
     {
         Type = 1,
-        Union = new InputUnion { Keyboard = new KeyboardInputData { VirtualKey = key, ScanCode = 0, Flags = flags, Time = 0, ExtraInfo = 0 } },
+        Union = new InputUnion { Keyboard = new KeyboardInputData { VirtualKey = key, ScanCode = 0, Flags = flags, Time = 0, ExtraInfo = NativeMethods.SwarmInputMarker } },
     };
 
     private static Input UnicodeInput(char character, uint flags) => new()
     {
         Type = 1,
-        Union = new InputUnion { Keyboard = new KeyboardInputData { VirtualKey = 0, ScanCode = character, Flags = flags, Time = 0, ExtraInfo = 0 } },
+        Union = new InputUnion { Keyboard = new KeyboardInputData { VirtualKey = 0, ScanCode = character, Flags = flags, Time = 0, ExtraInfo = NativeMethods.SwarmInputMarker } },
     };
 
     private static Input MouseInput(uint flags, int data = 0) => new()

@@ -15,12 +15,19 @@ public partial class MainWindow : Window
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     /// <summary>后台重建总预算：超时降级为仅截图，绝不让 UIA/编码把输入卡住。</summary>
     private static readonly TimeSpan RebuildBudget = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// IA2 读取预算：与 UIA 并行读取，正常会在 UIA 返回前完成。
+    /// 返回后最多再等 500ms，避免个别窗口的 COM 卡顿把重建拖慢。
+    /// </summary>
+    private static readonly TimeSpan Ia2Budget = TimeSpan.FromMilliseconds(500);
     private readonly TaskCompletionSource _rendererReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private TaskCompletionSource<bool>? _rebuildReady;
     private bool _rebuildRenderFailed;
     private CancellationTokenSource? _rebuildCts;
     private readonly DesktopTaskService _tasks;
     private readonly DesktopIpcServer _ipcServer;
+    private readonly DesktopControlServer _controlServer;
     private readonly DispatcherTimer _pointerPump;
     private nint _handle;
     private nint _keyboardHook;
@@ -52,6 +59,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         _tasks = new DesktopTaskService(this);
         _ipcServer = new DesktopIpcServer(HandleIpc);
+        _controlServer = new DesktopControlServer(() => _tasks.CancelCurrent());
         _pointerPump = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(33) };
         _pointerPump.Tick += (_, _) => SamplePointer();
         SourceInitialized += OnSourceInitialized;
@@ -76,7 +84,14 @@ public partial class MainWindow : Window
         {
             var dataDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SwarmCursors", "WebView2");
             Directory.CreateDirectory(dataDirectory);
-            var environment = await CoreWebView2Environment.CreateAsync(null, dataDirectory);
+            // 桌面覆盖层是点击穿透的，收不到真实 pointerdown；AudioContext 会被 Chromium
+            // 自动播放策略卡在 suspended 态，导致整个语义重建无声。显式放开自动播放，让上下文
+            // 一创建就是 running，JS 侧 unlockSound 作为键盘路径的兜底。
+            var options = new CoreWebView2EnvironmentOptions
+            {
+                AdditionalBrowserArguments = "--autoplay-policy=no-user-gesture-required",
+            };
+            var environment = await CoreWebView2Environment.CreateAsync(null, dataDirectory, options);
             await WebView.EnsureCoreWebView2Async(environment);
             WebView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
             WebView.CoreWebView2.WebMessageReceived += OnWebMessage;
@@ -86,8 +101,12 @@ public partial class MainWindow : Window
             };
             var rendererDirectory = Path.Combine(AppContext.BaseDirectory, "renderer");
             WebView.CoreWebView2.SetVirtualHostNameToFolderMapping("swarm.desktop", rendererDirectory, CoreWebView2HostResourceAccessKind.Allow);
+            // 虚拟主机映射同样会进 Chromium 磁盘缓存：升级程序后旧的 CSS/JS 仍会生效，
+            // 渲染层修复看起来“没生效”。启动时清一次磁盘缓存，保证随程序发布的渲染文件一定是最新的。
+            await WebView.CoreWebView2.Profile.ClearBrowsingDataAsync(CoreWebView2BrowsingDataKinds.DiskCache);
             WebView.Source = new Uri("https://swarm.desktop/index.html");
             _ipcServer.Start();
+            _controlServer.Start();
             if (_hotkeyWarning is not null)
                 MessageBox.Show(this, _hotkeyWarning, "Swarm Desktop 热键不可用", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
@@ -104,9 +123,9 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task<string> HandleIpc(string line, int processId)
+    private async Task<string> HandleIpc(string line, int processId, Func<double, string?, Task> progress)
     {
-        var operation = Dispatcher.InvokeAsync(() => _tasks.HandleJsonAsync(line, processId));
+        var operation = Dispatcher.InvokeAsync(() => _tasks.HandleJsonAsync(line, processId, progress));
         var request = await operation.Task;
         return await request;
     }
@@ -126,6 +145,7 @@ public partial class MainWindow : Window
         if (!NativeMethods.RegisterHotKey(_handle, 2, altShiftNoRepeat, 0x55)) unavailable.Add("Alt+Shift+U（任务重建）");
         // 全局硬停：Ctrl+Alt+Shift+Esc，不依赖目标是否在前台；注册失败必须明确告警，不能静默。
         if (!NativeMethods.RegisterHotKey(_handle, 4, 0x0001 | 0x0002 | 0x0004 | 0x4000, 0x1B)) unavailable.Add("Ctrl+Alt+Shift+Esc（急停）");
+        if (!NativeMethods.RegisterHotKey(_handle, 5, 0x0001 | 0x0002 | 0x0004 | 0x4000, 0x52)) unavailable.Add("Ctrl+Alt+Shift+R（恢复 AI 控制）");
         if (unavailable.Count > 0)
         {
             var detail = string.Join("、", unavailable);
@@ -156,6 +176,9 @@ public partial class MainWindow : Window
             case 4:
                 _ = Dispatcher.InvokeAsync(StopOverlay);
                 break;
+            case 5:
+                _ = Dispatcher.InvokeAsync(_tasks.ResumeLocal);
+                break;
         }
         return IntPtr.Zero;
     }
@@ -169,10 +192,14 @@ public partial class MainWindow : Window
         if (code >= 0 && (int)wParam is NativeMethods.WmKeyDown or NativeMethods.WmSysKeyDown)
         {
             var info = Marshal.PtrToStructure<NativeMethods.KeyboardHookInfo>(lParam);
-            if (info.VirtualKey == 0x1B && ShouldConsumeEscape())
+            if (info.ExtraInfo != (nuint)NativeMethods.SwarmInputMarker)
             {
-                _ = Dispatcher.InvokeAsync(StopOverlay);
-                return 1;
+                _tasks.PauseForHumanInput();
+                if (info.VirtualKey == 0x1B && ShouldConsumeEscape())
+                {
+                    _ = Dispatcher.InvokeAsync(StopOverlay);
+                    return 1;
+                }
             }
         }
         return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
@@ -187,13 +214,22 @@ public partial class MainWindow : Window
     /// </summary>
     private nint MouseHook(int code, nint wParam, nint lParam)
     {
-        if (code >= 0 && _hudRectValid && _overlayMode != OverlayMode.None && IsVisible)
+        if (code >= 0)
         {
             var message = (int)wParam;
             var info = Marshal.PtrToStructure<NativeMethods.MouseHookInfo>(lParam);
-            // AI 自己注入的点击（带 SwarmInputMarker）必须原样落到真实窗口；若被 HUD 吞掉，动作会“执行成功”但界面无反应。
-            // 其余注入（含自动化测试）与真实点击一样按 HUD 命中处理，保证控制条可点。
-            if (info.ExtraInfo != NativeMethods.SwarmInputMarker
+            var humanInput = info.ExtraInfo != NativeMethods.SwarmInputMarker && message is
+                NativeMethods.WmLButtonDown or NativeMethods.WmLButtonUp or
+                NativeMethods.WmRButtonDown or NativeMethods.WmRButtonUp or
+                NativeMethods.WmMButtonDown or NativeMethods.WmMButtonUp or
+                NativeMethods.WmXButtonDown or NativeMethods.WmXButtonUp or
+                NativeMethods.WmMouseWheel or NativeMethods.WmMouseHWheel;
+            // 纯鼠标移动不接管；按钮与滚轮立即暂停本代次，AI 注入则凭标记排除。
+            if (humanInput) _tasks.PauseForHumanInput();
+
+            // AI 自己注入的点击必须原样落到真实窗口；人工点击 HUD 时仍按原路径转成 DOM 事件。
+            if (humanInput
+                && _hudRectValid && _overlayMode != OverlayMode.None && IsVisible
                 && (message == NativeMethods.WmLButtonDown || message == NativeMethods.WmLButtonUp)
                 && TryCssPointer(out var x, out var y) && _hudRect.Contains(x, y))
             {
@@ -274,6 +310,8 @@ public partial class MainWindow : Window
         try
         {
             var snapshotTask = Task.Run(() => UiaSnapshotReader.Read(foreground), token);
+            // IA2 与 UIA 是两条独立通道：并行读取，IA2 只负责把命中元素的字符几何补精确。
+            var ia2Task = Task.Run(() => Ia2TextReader.Read(foreground, capture.WorkArea), token);
             UiaSnapshot snapshot;
             try
             {
@@ -283,16 +321,46 @@ public partial class MainWindow : Window
             {
                 // 放弃等待后仍观察一次异常，避免后台任务把未处理异常留到进程级。
                 _ = snapshotTask.ContinueWith(static task => _ = task.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                _ = ia2Task.ContinueWith(static task => _ = task.Exception, TaskContinuationOptions.OnlyOnFaulted);
                 return new RebuildOutcome(capture, DesktopPayload.Screenshot(capture), "截屏重建 · 语义读取超时，已降级为截图");
             }
             token.ThrowIfCancellationRequested();
-            var (candidate, decision) = DesktopPayload.Semantic(capture, snapshot);
+            var ia2 = AwaitIa2(ia2Task, token);
+            var (candidate, decision) = DesktopPayload.Semantic(capture, snapshot, ia2);
             var rebuild = decision.IsFallback ? DesktopPayload.Screenshot(capture) : candidate;
             return new RebuildOutcome(capture, rebuild, Describe(decision));
         }
         catch (Exception error) when (error is InvalidOperationException or System.Runtime.InteropServices.COMException or UnauthorizedAccessException)
         {
             return new RebuildOutcome(capture, DesktopPayload.Screenshot(capture), "截屏重建 · 无法读取该窗口的辅助功能信息");
+        }
+    }
+
+    /// <summary>
+    /// 等 IA2 结果，但绝不超过 <see cref="Ia2Budget"/>：读不到或超时就返回 null，
+    /// 由 <see cref="DesktopPayload.Semantic"/> 走纯 UIA 路径，重建本身不受影响。
+    /// </summary>
+    private static Ia2Snapshot? AwaitIa2(Task<Ia2Snapshot> task, CancellationToken token)
+    {
+        try
+        {
+            var snapshot = task.WaitAsync(Ia2Budget, token).GetAwaiter().GetResult();
+            FileLog.Write(
+                "desktop",
+                $"[ia2] lines={snapshot.Lines.Count} visited={snapshot.Visited} textNodes={snapshot.TextNodes} " +
+                $"glyphs={snapshot.Glyphs} ms={snapshot.ElapsedMilliseconds} timedOut={snapshot.TimedOut}");
+            return snapshot;
+        }
+        catch (TimeoutException)
+        {
+            _ = task.ContinueWith(static item => _ = item.Exception, TaskContinuationOptions.OnlyOnFaulted);
+            FileLog.Write("desktop", "[ia2] timeout, fallback to uia");
+            return null;
+        }
+        catch (Exception error) when (error is System.Runtime.InteropServices.COMException or InvalidOperationException)
+        {
+            FileLog.Write("desktop", $"[ia2] failed: {error.Message}, fallback to uia");
+            return null;
         }
     }
 
@@ -317,7 +385,10 @@ public partial class MainWindow : Window
 
     private static string Describe(RebuildDecision decision) => decision switch
     {
-        { Mode: RebuildMode.Semantic, Truncated: true } => $"语义重建 · {decision.NamedControls} 个控件（读取超时，结果不完整）",
+        { Reason: RebuildFallbackReason.FrameOnly } => $"框架重建 · 该窗口未开放辅助功能，内容按原像素还原（{decision.NamedControls} 个控件）",
+        { Mode: RebuildMode.Semantic, Truncation: UiaTruncationReason.DepthLimit } => $"语义重建 · {decision.NamedControls} 个控件（已达到遍历深度上限，结果不完整）",
+        { Mode: RebuildMode.Semantic, Truncation: UiaTruncationReason.NodeLimit } => $"语义重建 · {decision.NamedControls} 个控件（控件数量达到上限，结果不完整）",
+        { Mode: RebuildMode.Semantic, Truncation: UiaTruncationReason.TimeLimit } => $"语义重建 · {decision.NamedControls} 个控件（读取超时，结果不完整）",
         { Mode: RebuildMode.Semantic } => $"语义重建 · {decision.NamedControls} 个控件",
         { Reason: RebuildFallbackReason.ShellDesktop } => "截屏重建 · 桌面由壁纸渲染，直接使用截屏",
         { Reason: RebuildFallbackReason.SparseSemantics } => $"截屏重建 · 该窗口未提供足够的辅助功能信息（{decision.NamedControls} 个控件）",
@@ -622,7 +693,8 @@ public partial class MainWindow : Window
         if (WebView.CoreWebView2 == null) return;
         try
         {
-            WebView.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(message, JsonOptions));
+            var json = JsonSerializer.Serialize(message, JsonOptions);
+            WebView.CoreWebView2.PostWebMessageAsJson(json);
         }
         catch (InvalidOperationException)
         {
@@ -638,6 +710,7 @@ public partial class MainWindow : Window
         NativeMethods.UnregisterHotKey(_handle, 1);
         NativeMethods.UnregisterHotKey(_handle, 2);
         NativeMethods.UnregisterHotKey(_handle, 4);
+        NativeMethods.UnregisterHotKey(_handle, 5);
         if (_keyboardHook != 0)
         {
             NativeMethods.UnhookWindowsHookEx(_keyboardHook);
@@ -650,5 +723,6 @@ public partial class MainWindow : Window
         }
         if (_handle != 0) NativeMethods.SetWindowDisplayAffinity(_handle, 0);
         await _ipcServer.StopAsync();
+        await _controlServer.StopAsync();
     }
 }

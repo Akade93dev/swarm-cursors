@@ -4,7 +4,10 @@ using Swarm.Core.Semantics;
 
 namespace Swarm.Desktop;
 
-/// <summary>窗口客户区抓屏结果。Backend=screen 表示 PrintWindow 失败后降级屏幕裁剪；Occluded 仅在降级且实测被遮挡时为真。</summary>
+/// <summary>
+/// 窗口客户区抓屏结果。Backend 为实际出帧的后端（wgc/print/screen）；
+/// Occluded 仅在屏幕裁剪降级且实测被遮挡时为真；FrameAgeMs 是 WGC 帧距采集时刻的时差。
+/// </summary>
 public sealed record WindowCapture(
     RgbaFrame Frame,
     RectInt Monitor,
@@ -14,24 +17,36 @@ public sealed record WindowCapture(
     nint Window,
     bool Occluded,
     bool Blank,
-    string Backend = "print")
+    string Backend = "print",
+    long FrameAgeMs = 0)
 {
     public int MonitorOffsetX => ClientScreen.X - Monitor.X;
     public int MonitorOffsetY => ClientScreen.Y - Monitor.Y;
 }
 
 /// <summary>
-/// 窗口级抓屏：优先 PrintWindow 客户区，遮挡时仍能得到干净像素；
-/// 空白/失败时降级为整屏裁剪并如实标记 occluded。同一窗口 300ms 内复用，避免并发重复抓屏。
+/// 窗口级抓屏入口：按后端链顺序尝试（WGC → PrintWindow → 屏幕裁剪），第一个非空白帧获胜；
+/// 空白/失败时降级并如实标记 occluded。同一窗口 300ms 内复用，避免并发重复抓屏。
 /// </summary>
 public static class CaptureService
 {
-    private const uint PwClientOnly = 0x1;
-    private const uint PwRenderFullContent = 0x2;
     private static readonly SemaphoreSlim Gate = new(1, 1);
+    private static readonly WgcSessionCache WgcSessions = new();
+    private static readonly CapturePipeline Pipeline = CreatePipeline();
     private static WindowCapture? _last;
     private static DateTimeOffset _lastAt;
     private static nint _lastWindow;
+
+    private static CapturePipeline CreatePipeline()
+    {
+        if (string.Equals(Environment.GetEnvironmentVariable("SWARM_CAPTURE_BACKEND"), "screen", StringComparison.OrdinalIgnoreCase))
+            return new CapturePipeline(new ScreenFallbackBackend());
+
+        return new CapturePipeline(
+            new WgcWindowBackend(WgcSessions),
+            new PrintWindowBackend(),
+            new ScreenFallbackBackend());
+    }
 
     public static async Task<WindowCapture> CaptureAsync(nint window, CancellationToken cancellationToken = default, bool allowReuse = true)
     {
@@ -88,100 +103,24 @@ public static class CaptureService
     private static WindowCapture Capture(nint window)
     {
         var (monitor, clientScreen, clientBounds, dpi) = Geometry(window);
+        var captured = Pipeline.Capture(
+            window,
+            new CaptureGeometry(monitor, clientScreen, clientBounds, dpi));
 
-        var frame = CapturePrint(window, PwClientOnly | PwRenderFullContent, clientBounds.Width, clientBounds.Height)
-                    ?? CapturePrintFullWindowClient(window, clientScreen, clientBounds, PwRenderFullContent)
-                    ?? CapturePrintFullWindowClient(window, clientScreen, clientBounds, 0);
-        var backend = "print";
-        var occluded = false;
-        var blank = frame == null || FrameStats.IsBlank(frame);
-        if (frame == null || blank)
-        {
-            var fallback = ScreenCapture.CaptureForWindow(window);
-            var offsetX = clientScreen.X - fallback.WorkArea.X;
-            var offsetY = clientScreen.Y - fallback.WorkArea.Y;
-            frame = Crop(fallback.Frame, offsetX, offsetY, clientBounds.Width, clientBounds.Height) ?? fallback.Frame;
-            backend = "screen";
-            // 屏幕像素只有在目标确实可见时才可信：前台，或客户区采样点全部归属目标。
-            occluded = !IsUnobstructed(window, clientScreen, clientBounds);
-            blank = FrameStats.IsBlank(frame);
-        }
+        if (captured.Frame is not { } frame)
+            throw new DesktopOperationException("capture_unavailable", "抓屏失败：所有后端均未返回画面");
 
-        return new WindowCapture(frame, monitor, clientScreen, clientBounds, dpi, window, occluded, blank, backend);
-    }
-
-    /// <summary>部分应用不支持 PW_CLIENTONLY：整窗渲染后按客户区偏移裁剪。</summary>
-    private static RgbaFrame? CapturePrintFullWindowClient(nint window, RectInt clientScreen, RectInt clientBounds, uint flags)
-    {
-        if (!NativeMethods.GetWindowRect(window, out var windowRect)) return null;
-        var width = windowRect.Right - windowRect.Left;
-        var height = windowRect.Bottom - windowRect.Top;
-        if (width <= 0 || height <= 0) return null;
-        var full = CapturePrint(window, flags, width, height);
-        if (full == null) return null;
-        return Crop(full, clientScreen.X - windowRect.Left, clientScreen.Y - windowRect.Top, clientBounds.Width, clientBounds.Height);
-    }
-
-    /// <summary>客户区 5×5 采样全部命中目标即视为未遮挡；部分遮挡按保守策略判为遮挡。</summary>
-    private static bool IsUnobstructed(nint window, RectInt clientScreen, RectInt clientBounds)
-    {
-        if (NativeMethods.GetForegroundWindow() == window) return true;
-        var client = new RectInt(clientScreen.X, clientScreen.Y, clientBounds.Width, clientBounds.Height);
-        foreach (var (sampleX, sampleY) in OcclusionSampler.SamplePoints(client))
-        {
-            var hit = NativeMethods.WindowFromPoint(new NativeMethods.Win32Point { X = sampleX, Y = sampleY });
-            if (hit == 0 || NativeMethods.GetAncestor(hit, 2) != window) return false;
-        }
-        return true;
-    }
-
-    private static RgbaFrame? CapturePrint(nint window, uint flags, int width, int height)
-    {
-        if (width <= 0 || height <= 0) return null;
-        var screen = NativeMethods.GetDC(0);
-        nint memory = 0;
-        nint bitmap = 0;
-        nint previous = 0;
-        try
-        {
-            if (screen == 0) return null;
-            memory = NativeMethods.CreateCompatibleDC(screen);
-            if (memory == 0) return null;
-            bitmap = NativeMethods.CreateCompatibleBitmap(screen, width, height);
-            if (bitmap == 0) return null;
-            previous = NativeMethods.SelectObject(memory, bitmap);
-            if (!NativeMethods.PrintWindow(window, memory, flags)) return null;
-            return ScreenCapture.ReadPixels(memory, bitmap, width, height);
-        }
-        catch
-        {
-            return null;
-        }
-        finally
-        {
-            if (previous != 0) NativeMethods.SelectObject(memory, previous);
-            if (bitmap != 0) NativeMethods.DeleteObject(bitmap);
-            if (memory != 0) NativeMethods.DeleteDC(memory);
-            if (screen != 0) NativeMethods.ReleaseDC(0, screen);
-        }
-    }
-
-    private static RgbaFrame? Crop(RgbaFrame source, int x, int y, int width, int height)
-    {
-        if (width <= 0 || height <= 0) return null;
-        var left = Math.Clamp(x, 0, source.Width - 1);
-        var top = Math.Clamp(y, 0, source.Height - 1);
-        var right = Math.Clamp(x + width, left + 1, source.Width);
-        var bottom = Math.Clamp(y + height, top + 1, source.Height);
-        var w = right - left;
-        var h = bottom - top;
-        if (w == source.Width && h == source.Height) return source;
-        var pixels = new byte[w * h * 4];
-        for (var row = 0; row < h; row++)
-        {
-            Buffer.BlockCopy(source.Pixels, ((top + row) * source.Width + left) * 4, pixels, row * w * 4, w * 4);
-        }
-        return new RgbaFrame(w, h, pixels);
+        return new WindowCapture(
+            frame,
+            monitor,
+            clientScreen,
+            clientBounds,
+            dpi,
+            window,
+            captured.Occluded,
+            captured.Blank,
+            captured.Backend,
+            captured.FrameAgeMs);
     }
 
     /// <summary>等比缩放到最长边不超过 maxEdge，降低截图经 IPC/MCP 传输的体积。</summary>

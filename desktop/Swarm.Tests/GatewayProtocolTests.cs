@@ -95,6 +95,114 @@ public class GatewayProtocolTests
         Assert.Contains("Esc", tools[8].GetProperty("description").GetString(), StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task ToolsListDeclaresAnnotationsAndOutputSchemas()
+    {
+        var gateway = new McpGateway(new FakeTransport());
+
+        var response = await gateway.HandleLineAsync("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/list\",\"params\":{}}");
+
+        using var document = JsonDocument.Parse(response!);
+        var tools = document.RootElement.GetProperty("result").GetProperty("tools");
+        var expected = new Dictionary<string, (bool ReadOnly, bool Destructive, bool Idempotent, bool OpenWorld)>
+        {
+            ["task_begin"] = (false, false, false, true),
+            ["observe"] = (true, false, true, true),
+            ["click"] = (false, true, false, true),
+            ["type_text"] = (false, true, false, true),
+            ["press_key"] = (false, true, false, true),
+            ["scroll"] = (false, false, false, true),
+            ["focus"] = (false, false, true, true),
+            ["task_end"] = (false, false, true, false),
+            ["task_stop"] = (false, false, true, false),
+        };
+
+        Assert.Equal(expected.Count, tools.GetArrayLength());
+        foreach (var tool in tools.EnumerateArray())
+        {
+            var name = tool.GetProperty("name").GetString()!;
+            var want = expected[name];
+            var annotations = tool.GetProperty("annotations");
+            Assert.Equal(want.ReadOnly, annotations.GetProperty("readOnlyHint").GetBoolean());
+            Assert.Equal(want.Destructive, annotations.GetProperty("destructiveHint").GetBoolean());
+            Assert.Equal(want.Idempotent, annotations.GetProperty("idempotentHint").GetBoolean());
+            Assert.Equal(want.OpenWorld, annotations.GetProperty("openWorldHint").GetBoolean());
+
+            var schema = tool.GetProperty("outputSchema");
+            Assert.Equal("object", schema.GetProperty("type").GetString());
+            Assert.True(schema.GetProperty("additionalProperties").GetBoolean());
+            var properties = schema.GetProperty("properties");
+            var isEnd = name is "task_end" or "task_stop";
+            var isAction = name is "click" or "type_text" or "press_key" or "scroll" or "focus";
+            if (isEnd)
+            {
+                Assert.True(properties.TryGetProperty("ok", out _));
+            }
+            else if (isAction)
+            {
+                Assert.True(properties.TryGetProperty("executed", out _));
+                Assert.True(properties.TryGetProperty("tier", out _));
+                Assert.True(properties.TryGetProperty("verified", out _));
+            }
+            else
+            {
+                Assert.True(properties.TryGetProperty("token", out _));
+                Assert.True(properties.TryGetProperty("generation", out _));
+                Assert.True(properties.TryGetProperty("elements", out _));
+            }
+        }
+    }
+
+    [Fact]
+    public async Task InitializeEchoesSupportedVersionAndFallsBackOtherwise()
+    {
+        var gateway = new McpGateway(new FakeTransport());
+
+        var echoed = await gateway.HandleLineAsync("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\"}}");
+        using (var document = JsonDocument.Parse(echoed!))
+            Assert.Equal("2024-11-05", document.RootElement.GetProperty("result").GetProperty("protocolVersion").GetString());
+
+        var fallback = await gateway.HandleLineAsync("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2099-01-01\"}}");
+        using (var document = JsonDocument.Parse(fallback!))
+            Assert.Equal("2024-11-05", document.RootElement.GetProperty("result").GetProperty("protocolVersion").GetString());
+    }
+
+    [Fact]
+    public async Task CancelledNotificationStopsInFlightToolCall()
+    {
+        var transport = new FakeTransport();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        transport.Handler = async (token, _) =>
+        {
+            started.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            throw new InvalidOperationException("不可达");
+        };
+        var gateway = new McpGateway(transport);
+
+        var call = gateway.HandleLineAsync("{\"jsonrpc\":\"2.0\",\"id\":\"slow\",\"method\":\"tools/call\",\"params\":{\"name\":\"observe\",\"arguments\":{\"token\":\"t1\"}}}");
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var notification = await gateway.HandleLineAsync("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"slow\"}}");
+
+        Assert.Null(notification);
+        var response = await call.WaitAsync(TimeSpan.FromSeconds(5));
+        using var document = JsonDocument.Parse(response!);
+        Assert.Equal(-32800, document.RootElement.GetProperty("error").GetProperty("code").GetInt32());
+        Assert.Equal(1, transport.CancelCount);
+    }
+
+    [Fact]
+    public async Task CancelledNotificationForUnknownRequestIsIgnored()
+    {
+        var transport = new FakeTransport();
+        var gateway = new McpGateway(transport);
+
+        var response = await gateway.HandleLineAsync("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"missing\"}}");
+
+        Assert.Null(response);
+        Assert.Equal(0, transport.CancelCount);
+    }
+
     public static IEnumerable<object[]> ToolCalls()
     {
         yield return new object[] { "task_begin", "{\"targetProcess\":\"notepad\",\"targetTitle\":\"Untitled\"}" };
@@ -239,17 +347,124 @@ public class GatewayProtocolTests
         Assert.Throws<InvalidDataException>(() => GatewayIpcProtocol.ParseResponse(response, "expected"));
     }
 
+    [Fact]
+    public void IpcProgressLinesAreNotFinalResponses()
+    {
+        const string progressLine = "{\"id\":\"req\",\"progress\":{\"value\":0.25,\"message\":\"uia\"}}";
+
+        Assert.True(GatewayIpcProtocol.TryParseProgress(progressLine, "req", out var progress));
+        Assert.Equal(0.25, progress.Value);
+        Assert.Equal("uia", progress.Message);
+        Assert.False(GatewayIpcProtocol.TryParseProgress("{\"id\":\"req\",\"ok\":true,\"result\":{}}", "req", out _));
+        Assert.False(GatewayIpcProtocol.TryParseProgress(progressLine, "other", out _));
+        Assert.False(GatewayIpcProtocol.TryParseProgress("{not-json}", "req", out _));
+    }
+
+    [Fact]
+    public async Task ProgressIsForwardedAsNotificationsWhenRequestHasAStringToken()
+    {
+        var transport = new FakeTransport
+        {
+            Handler = async (_, progress) =>
+            {
+                Assert.NotNull(progress);
+                await progress!(new DesktopProgress(0.2, "capture"));
+                await progress(new DesktopProgress(0.55, "uia"));
+                return DesktopIpcResponse.Success(JsonDocument.Parse("{\"token\":\"t1\"}").RootElement.Clone());
+            },
+        };
+        var notifications = new List<string>();
+        var gateway = new McpGateway(transport, json =>
+        {
+            notifications.Add(json);
+            return Task.CompletedTask;
+        });
+
+        var response = await gateway.HandleLineAsync(
+            "{\"jsonrpc\":\"2.0\",\"id\":\"prog\",\"method\":\"tools/call\",\"params\":{\"name\":\"observe\",\"arguments\":{\"token\":\"t1\"},\"_meta\":{\"progressToken\":\"tok-1\"}}}");
+
+        Assert.NotNull(response);
+        Assert.Equal(2, notifications.Count);
+        using var document = JsonDocument.Parse(notifications[0]);
+        Assert.Equal("notifications/progress", document.RootElement.GetProperty("method").GetString());
+        Assert.False(document.RootElement.TryGetProperty("id", out _));
+        var parameters = document.RootElement.GetProperty("params");
+        Assert.Equal("tok-1", parameters.GetProperty("progressToken").GetString());
+        Assert.Equal(0.2, parameters.GetProperty("progress").GetDouble());
+        Assert.Equal(1, parameters.GetProperty("total").GetDouble());
+        Assert.Equal("capture", parameters.GetProperty("message").GetString());
+    }
+
+    [Fact]
+    public async Task ProgressNumericTokenIsEchoedAsNumber()
+    {
+        var transport = new FakeTransport
+        {
+            Handler = async (_, progress) =>
+            {
+                await progress!(new DesktopProgress(0.4, "execute"));
+                return DesktopIpcResponse.Success(JsonDocument.Parse("{}").RootElement.Clone());
+            },
+        };
+        var notifications = new List<string>();
+        var gateway = new McpGateway(transport, json =>
+        {
+            notifications.Add(json);
+            return Task.CompletedTask;
+        });
+
+        await gateway.HandleLineAsync(
+            "{\"jsonrpc\":\"2.0\",\"id\":\"prog\",\"method\":\"tools/call\",\"params\":{\"name\":\"click\",\"arguments\":{\"token\":\"t1\"},\"_meta\":{\"progressToken\":42}}}");
+
+        using var document = JsonDocument.Parse(Assert.Single(notifications));
+        Assert.Equal(JsonValueKind.Number, document.RootElement.GetProperty("params").GetProperty("progressToken").ValueKind);
+        Assert.Equal(42, document.RootElement.GetProperty("params").GetProperty("progressToken").GetInt32());
+    }
+
+    [Fact]
+    public async Task ProgressIsNotSentWithoutAProgressToken()
+    {
+        var transport = new FakeTransport();
+        var notifications = new List<string>();
+        var gateway = new McpGateway(transport, json =>
+        {
+            notifications.Add(json);
+            return Task.CompletedTask;
+        });
+
+        await gateway.HandleLineAsync(
+            "{\"jsonrpc\":\"2.0\",\"id\":\"prog\",\"method\":\"tools/call\",\"params\":{\"name\":\"observe\",\"arguments\":{\"token\":\"t1\"}}}");
+
+        Assert.Null(transport.LastProgress);
+        Assert.Empty(notifications);
+    }
+
     private sealed class FakeTransport : IDesktopGatewayTransport
     {
         public List<(string Method, JsonElement Parameters)> Calls { get; } = new();
         public DesktopIpcResponse Response { get; set; } = DesktopIpcResponse.Success(JsonDocument.Parse("{}").RootElement.Clone());
         public Exception? Exception { get; set; }
+        public Func<CancellationToken, Func<DesktopProgress, Task>?, Task<DesktopIpcResponse>>? Handler { get; set; }
+        public Func<DesktopProgress, Task>? LastProgress { get; private set; }
+        public int CancelCount { get; private set; }
 
-        public Task<DesktopIpcResponse> SendAsync(string method, JsonElement parameters, CancellationToken cancellationToken = default)
+        public async Task<DesktopIpcResponse> SendAsync(
+            string method,
+            JsonElement parameters,
+            CancellationToken cancellationToken = default,
+            Func<DesktopProgress, Task>? progress = null)
         {
             Calls.Add((method, parameters.Clone()));
+            LastProgress = progress;
             if (Exception is not null) throw Exception;
-            return Task.FromResult(Response);
+            if (Handler is not null) return await Handler(cancellationToken, progress);
+            return Response;
+        }
+
+        public Task CancelAsync(CancellationToken cancellationToken = default)
+        {
+            CancelCount++;
+            return Task.CompletedTask;
         }
     }
 }

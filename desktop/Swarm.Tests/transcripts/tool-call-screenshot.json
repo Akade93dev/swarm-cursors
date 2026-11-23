@@ -1,0 +1,32 @@
+{
+  "name": "tool-call-screenshot",
+  "transport": {
+    "result": {"token":"t1","window":{"title":"Untitled"},"screenshot":{"mimeType":"image/png","data":"aGVsbG8="}}
+  },
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": "shot",
+        "method": "tools/call",
+        "params": {
+          "name": "observe",
+          "arguments": {"token":"t1","includeScreenshot":true}
+        }
+      },
+      "expect": {
+        "response": {
+          "jsonrpc": "2.0",
+          "id": "shot",
+          "result": {
+            "structuredContent": {"token":"t1","window":{"title":"Untitled"}},
+            "content": [
+              {"type":"text","text":"{\"token\":\"t1\",\"window\":{\"title\":\"Untitled\"}}"},
+              {"type":"image","mimeType":"image/png","data":"aGVsbG8="}
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "name": "cancel-in-flight",
+  "transport": {
+    "holdUntilCancelled": true
+  },
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": "slow",
+        "method": "tools/call",
+        "params": {"name":"observe","arguments":{"token":"t1"}}
+      },
+      "hold": true,
+      "expect": {}
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId":"slow"}
+      },
+      "expect": {}
+    },
+    {
+      "await": true,
+      "expect": {
+        "response": {
+          "jsonrpc": "2.0",
+          "id": "slow",
+          "error": {"code": -32800, "message": "Request cancelled"}
+        }
+      }
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 using Swarm.Core.Capture;
 using Swarm.Core.Operations;
+using Swarm.Core.Semantics;
 
 namespace Swarm.Tests;
 
@@ -109,6 +110,40 @@ public class OperationRuntimeTests
         }, TimeSpan.FromSeconds(5)));
 
         Assert.True(await siblingCanceled.Task.WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    [Fact]
+    public async Task ExecutionSuccessDoesNotImplyVerification()
+    {
+        var observer = new Collector();
+        var runner = new OperationRunner(observer);
+        runner.BeginSession("测试", "pid 1");
+        var step = new OperationStep { Id = "unverified", Kind = OperationKind.Click, Label = "点击" };
+        step.ReportTransport(InputTier.Input, false, "像素变化不足", MessageEvidence.None);
+
+        await runner.RunAsync(step, _ => Task.CompletedTask, TimeSpan.FromSeconds(2));
+
+        var end = observer.Events.Last(item => item.Step?.Id == "unverified" && item.Phase == "end");
+        Assert.Equal(OperationStatus.Succeeded, end.Step!.Status);
+        Assert.False(end.Step.Verified);
+        Assert.Equal(OperationVerificationStatus.Unverified, end.Step.Verification);
+        Assert.Equal(MessageEvidence.None, end.Step.Evidence);
+    }
+
+    [Fact]
+    public void ControlStatesShareTheSessionSequence()
+    {
+        var observer = new Collector();
+        var runner = new OperationRunner(observer);
+        var session = runner.BeginSession("测试", "pid 1");
+
+        runner.ReportControl("paused");
+        runner.ReportControl("running");
+
+        var controls = observer.Events.Where(item => item.Kind == "control").ToList();
+        Assert.Equal(new[] { "paused", "running" }, controls.Select(item => item.Status));
+        Assert.All(controls, item => Assert.Equal(session.Id, item.SessionId));
+        Assert.Equal(new long[] { 2, 3 }, controls.Select(item => item.Seq));
     }
 
     [Fact]

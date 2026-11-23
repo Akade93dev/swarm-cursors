@@ -4,6 +4,7 @@ using System.IO;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using Swarm.Core.Diagnostics;
 
 namespace Swarm.Desktop;
@@ -13,11 +14,11 @@ public sealed class DesktopIpcServer
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromMinutes(1);
     // 正常请求是几百字节的 JSON；设置上限可避免本机异常/恶意客户端用超长单行耗尽内存。
     private const int MaxRequestChars = 1 << 20;
-    private readonly Func<string, int, Task<string>> _handler;
+    private readonly Func<string, int, Func<double, string?, Task>, Task<string>> _handler;
     private readonly CancellationTokenSource _stop = new();
     private Task? _loop;
 
-    public DesktopIpcServer(Func<string, int, Task<string>> handler) => _handler = handler;
+    public DesktopIpcServer(Func<string, int, Func<double, string?, Task>, Task<string>> handler) => _handler = handler;
 
     // 管道 I/O 必须完全离开 UI 线程：同步 drain 或卡死的客户端否则会冻结覆盖层与全局钩子。
     public void Start() => _loop = Task.Run(RunAsync);
@@ -62,7 +63,7 @@ public sealed class DesktopIpcServer
                     try
                     {
                         response = IsTrustedGateway(processId)
-                            ? await _handler(line, (int)processId)
+                            ? await _handler(line, (int)processId, (value, message) => WriteProgressAsync(writer, line, value, message, _stop.Token))
                             : UnauthorizedResponse();
                     }
                     catch (Exception error)
@@ -97,7 +98,7 @@ public sealed class DesktopIpcServer
     /// 发布版主模块为 Swarm.Gateway.exe；开发期用 dotnet 托管启动时主模块是 dotnet，
     /// 需要在已加载模块中找到 Swarm.Gateway.dll 才放行。
     /// </summary>
-    private static bool IsTrustedGateway(uint processId)
+    internal static bool IsTrustedGateway(uint processId)
     {
         if (processId == 0) return false;
         try
@@ -123,7 +124,7 @@ public sealed class DesktopIpcServer
     /// 读取一行请求并限制长度。StreamReader.ReadLineAsync 会把整行缓冲完才返回，
     /// 本机客户端一旦发送超长行就会占满进程内存，因此改为分块读取并在超限时断开连接。
     /// </summary>
-    private static async Task<string?> ReadLineAsync(StreamReader reader, CancellationToken token)
+    internal static async Task<string?> ReadLineAsync(StreamReader reader, CancellationToken token)
     {
         var builder = new StringBuilder(1024);
         var buffer = new char[4096];
@@ -141,10 +142,50 @@ public sealed class DesktopIpcServer
         }
     }
 
+    /// <summary>
+    /// 在最终响应前写一行进度：Gateway 读到不含 ok 的 progress 行就转成 MCP 通知并继续读。
+    /// 数值统一由 System.Text.Json 按不变文化序列化，避免区域设置把小数点写成逗号。
+    /// </summary>
+    private static async Task WriteProgressAsync(
+        StreamWriter writer,
+        string requestLine,
+        double value,
+        string? message,
+        CancellationToken token)
+    {
+        var clamped = double.IsFinite(value) ? Math.Clamp(value, 0, 1) : 0;
+        var progress = new Dictionary<string, object?> { ["value"] = clamped };
+        if (!string.IsNullOrEmpty(message)) progress["message"] = message;
+        var json = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["id"] = RequestId(requestLine),
+            ["progress"] = progress,
+        });
+        await writer.WriteLineAsync(json.AsMemory(), token);
+        await writer.FlushAsync(token);
+    }
+
+    /// <summary>进度行必须带回请求 id，Gateway 才能确认它属于当前请求；畸形请求由处理器统一报错。</summary>
+    private static string RequestId(string requestLine)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(requestLine);
+            return document.RootElement.ValueKind == JsonValueKind.Object &&
+                   document.RootElement.TryGetProperty("id", out var id) && id.ValueKind == JsonValueKind.String
+                ? id.GetString() ?? string.Empty
+                : string.Empty;
+        }
+        catch (JsonException)
+        {
+            return string.Empty;
+        }
+    }
+
     private static string UnauthorizedResponse() =>
         "{\"id\":\"\",\"ok\":false,\"error\":{\"code\":\"unauthorized\",\"message\":\"未授权的本地客户端\"}}";
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GetNamedPipeClientProcessId(nint pipe, out uint processId);
+    internal static extern bool GetNamedPipeClientProcessId(nint pipe, out uint processId);
 }

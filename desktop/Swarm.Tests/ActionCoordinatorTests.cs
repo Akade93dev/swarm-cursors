@@ -27,6 +27,84 @@ public class ActionCoordinatorTests
     }
 
     [Fact]
+    public async Task 暂停取消等待队列且恢复后不补发旧动作()
+    {
+        var coordinator = new ActionCoordinator();
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var first = coordinator.RunAsync(
+            _ => Task.CompletedTask,
+            async token =>
+            {
+                firstStarted.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            });
+        await firstStarted.Task;
+        var queuedExecuted = false;
+        var queued = coordinator.RunAsync(
+            _ => Task.CompletedTask,
+            _ => { queuedExecuted = true; return Task.CompletedTask; });
+
+        coordinator.Pause();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => queued);
+        coordinator.Resume();
+        await coordinator.RunAsync(_ => Task.CompletedTask, _ => Task.CompletedTask);
+        Assert.False(queuedExecuted);
+    }
+
+    [Fact]
+    public async Task 暂停期间拒绝新动作恢复后只接受新动作()
+    {
+        var coordinator = new ActionCoordinator();
+        coordinator.Pause();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => coordinator.RunAsync(
+            _ => Task.CompletedTask,
+            _ => Task.CompletedTask));
+
+        coordinator.Resume();
+        var executed = false;
+        await coordinator.RunAsync(
+            _ => Task.CompletedTask,
+            _ => { executed = true; return Task.CompletedTask; });
+        Assert.True(executed);
+    }
+
+    [Fact]
+    public async Task 取消当前代次后会话仍可执行新动作()
+    {
+        var coordinator = new ActionCoordinator();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var running = coordinator.RunAsync(
+            _ => Task.CompletedTask,
+            async token =>
+            {
+                started.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            });
+        await started.Task;
+
+        coordinator.CancelCurrent();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => running);
+        var executed = false;
+        await coordinator.RunAsync(
+            _ => Task.CompletedTask,
+            _ => { executed = true; return Task.CompletedTask; });
+        Assert.True(executed);
+    }
+
+    [Fact]
+    public void 停止后不可恢复()
+    {
+        var coordinator = new ActionCoordinator();
+        coordinator.Stop();
+
+        Assert.Throws<InvalidOperationException>(coordinator.Resume);
+    }
+
+    [Fact]
     public async Task 动作串行且急停会取消等待队列()
     {
         var coordinator = new ActionCoordinator();

@@ -41,6 +41,24 @@ public class RebuildStrategyTests
     }
 
     [Fact]
+    public void 只有外壳但存在窗口矩形时改走框架重建()
+    {
+        // Chromium/Electron：命名控件不足，但窗口矩形本身可读，应保留底座像素并只重建框架。
+        var elements = new UiaElementInfo[] { Pane("0", "TRAE CN"), Pane("0.1", "关闭") };
+        var mapped = new[]
+        {
+            new DesktopElement { Id = "0", Kind = "rect", Semantic = "window", W = 400, H = 300 },
+            Mapped("0.1"),
+        };
+
+        var decision = RebuildStrategy.Decide(elements, mapped, UiaTruncationReason.None);
+
+        Assert.Equal(RebuildMode.Semantic, decision.Mode);
+        Assert.Equal(RebuildFallbackReason.FrameOnly, decision.Reason);
+        Assert.False(decision.IsFallback);
+    }
+
+    [Fact]
     public void 采集为空时回退并标记无元素()
     {
         var decision = RebuildStrategy.Decide(Array.Empty<UiaElementInfo>(), Array.Empty<DesktopElement>(), UiaTruncationReason.TimeLimit);
@@ -62,16 +80,20 @@ public class RebuildStrategyTests
         Assert.Equal(2, decision.NamedControls);
     }
 
-    [Fact]
-    public void 超时截断但命名控件足够时仍语义重建并标记不完整()
+    [Theory]
+    [InlineData(UiaTruncationReason.TimeLimit)]
+    [InlineData(UiaTruncationReason.DepthLimit)]
+    [InlineData(UiaTruncationReason.NodeLimit)]
+    public void 截断但命名控件足够时仍语义重建并保留具体原因(UiaTruncationReason truncation)
     {
         var elements = Enumerable.Range(0, 8).Select(i => Named($"t{i}", "Text", $"文本{i}")).ToArray();
         var mapped = elements.Select(element => Mapped(element.Id)).ToArray();
 
-        var decision = RebuildStrategy.Decide(elements, mapped, UiaTruncationReason.TimeLimit);
+        var decision = RebuildStrategy.Decide(elements, mapped, truncation);
 
         Assert.Equal(RebuildMode.Semantic, decision.Mode);
         Assert.True(decision.Truncated);
+        Assert.Equal(truncation, decision.Truncation);
         Assert.Equal(8, decision.NamedControls);
     }
 

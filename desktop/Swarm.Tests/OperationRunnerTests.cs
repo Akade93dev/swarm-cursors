@@ -38,10 +38,12 @@ public class OperationRunnerTests
         await runner.RunAsync(step, _ => Task.CompletedTask, TimeSpan.FromSeconds(5));
 
         var steps = recorder.Events.Where(x => x.Kind == "step").ToList();
-        Assert.Equal(2, steps.Count);
-        Assert.Equal(OperationStatus.Running, steps[0].Step!.Status);
-        Assert.Equal(OperationStatus.Succeeded, steps[1].Step!.Status);
-        Assert.NotNull(steps[1].Step!.DurationMs);
+        Assert.Equal(3, steps.Count);
+        Assert.Equal("plan", steps[0].Phase);
+        Assert.Equal(OperationStatus.Pending, steps[0].Step!.Status);
+        Assert.Equal(OperationStatus.Running, steps[1].Step!.Status);
+        Assert.Equal(OperationStatus.Succeeded, steps[2].Step!.Status);
+        Assert.NotNull(steps[2].Step!.DurationMs);
     }
 
     [Fact]

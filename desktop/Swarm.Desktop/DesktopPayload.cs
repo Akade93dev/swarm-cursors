@@ -28,7 +28,10 @@ public static class DesktopPayload
         return Rebuild(capture, background, new[] { BaseLayer(viewport.Width, viewport.Height, capture.Frame) });
     }
 
-    public static (DesktopRebuild Rebuild, RebuildDecision Decision) Semantic(CapturedScreen capture, UiaSnapshot snapshot)
+    public static (DesktopRebuild Rebuild, RebuildDecision Decision) Semantic(
+        CapturedScreen capture,
+        UiaSnapshot snapshot,
+        Ia2Snapshot? ia2 = null)
     {
         var mapper = capture.Mapper;
         var scale = mapper.CssScale;
@@ -64,6 +67,8 @@ public static class DesktopPayload
         // 语义不足时立即走整屏实拍：继续编码全部控件与整屏 base64 只会白烧预算，
         // 最后同样被调用方丢弃，还会把原本数百毫秒的重建拖成超时。
         if (decision.IsFallback) return (Screenshot(capture), decision);
+        // 框架重建：内容区保留底座原像素，只让窗口边框与外壳控件参与重建，避免整窗填色盖住真实内容。
+        var frameOnly = decision.Reason == RebuildFallbackReason.FrameOnly;
         // 字体信息来自 UIA TextPattern（有预算上限），拿不到的元素再用像素估计兜底。
         var textStyles = UiaTextStyleReader.Read(snapshot);
         var parentById = snapshot.Elements.ToDictionary(item => item.Id, item => item.ParentId, StringComparer.Ordinal);
@@ -80,6 +85,21 @@ public static class DesktopPayload
         var titlebarBottom = TitlebarBottoms(mapped);
         var clientAreas = ClientAreas(mapped, physicalById, titlebarBottom, capture, scale);
         var elements = new List<object>();
+        // 同一视觉行的文本片段必须共用行 y：各自按墨迹反推行盒会让单字符/内联片段上下抖动。
+        // 只统计普通 Text；输入框走单独的垂直居中分支，不参与行聚类。
+        var sharedLines = TextPlacement.SharedLineIds(mapped
+            .Where(item => item.Kind == "text" && item.Semantic == "text")
+            .Select(item => (item.Id, item.X, item.Y, item.W, item.H))
+            .ToList());
+        // IA2 逐字符几何已经有最终落位：命中的文本元素整块换成行元素，不再走 UIA 的框宽/墨迹校正。
+        var exactLines = ia2 is { Lines.Count: > 0 }
+            ? Ia2TextMatcher.Match(mapped, physicalById, ia2.Lines)
+                .GroupBy(item => item.Element.Id, StringComparer.Ordinal)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.Select(item => item.Line).ToList(),
+                    StringComparer.Ordinal)
+            : new Dictionary<string, List<Ia2Line>>(StringComparer.Ordinal);
         // 实拍底座：壁纸、桌面上的其它客户端与网页按原像素整张还原，避免只铺一层平色被看成“一块块拼”。
         // 被操作的窗口会在它上面整块覆盖并由语义元素重建，因此底座不会和重建文字叠出重影。
         elements.Add(BaseLayer(width, height, capture.Frame));
@@ -88,6 +108,11 @@ public static class DesktopPayload
             // 截图元素本身已经带着文字，再叠一层文本只会重影。
             if (element.Kind == "text" && InsideImage(element.Id, parentById, imageIds)) continue;
             textStyles.TryGetValue(element.Id, out var uia);
+            if (exactLines.TryGetValue(element.Id, out var lines))
+            {
+                foreach (var line in lines) elements.Add(Ia2Element(capture, element, line, uia, windowOf.ContainsKey(element.Id)));
+                continue;
+            }
             // 密码框只画固定掩码：UIA 的 ValuePattern/TextPattern 在部分实现里会回读明文，
             // 任何情况下都不能让明文进入载荷、WebView 或落盘 dump。
             var content = element.Sensitive ? PasswordMask : element.Text;
@@ -137,6 +162,7 @@ public static class DesktopPayload
             string? fontWeight = null;
             string? fontStyle = null;
             List<object>? spans = null;
+            string? surfaceColor = null;
             double? fontSize = null;
             double? lineHeight = null;
             var x = element.X;
@@ -158,7 +184,13 @@ public static class DesktopPayload
                 var style = RegionStyleAnalyzer.Analyze(capture.Frame, region);
                 radius = "0px";
                 color = style.Background.Css;
-                if (element.Semantic == "window")
+                if (frameOnly)
+                {
+                    // Chromium/Electron 的内容无法语义化：底色留给底座，只在有真实边框时补一条边。
+                    if (!style.HasBorder) continue;
+                    css = style.ToCss(scale, includeBackground: false);
+                }
+                else if (element.Semantic == "window")
                 {
                     // 窗口先按原样填底，随后补一块连续客户区，子容器叠在它上面。
                     css = style.ToCss(scale);
@@ -204,9 +236,27 @@ public static class DesktopPayload
                 }
                 // 输入框取内圈薄带做底色，避开正文笔画和选中高亮；Label 仍然整块取主色。
                 var background = box?.Background ?? RegionStyleAnalyzer.DominantColor(capture.Frame, region);
+                // 透明覆盖层把文字降级为灰度抗锯齿（字形偏重），截图底座的原文也会从下方透出双绘加粗；
+                // 给文字一层与所在表面同色的不透明底色，让 Chromium 重新启用 ClearType 并盖住原文。
+                // 只在表面色可信时铺（输入框或落在窗口内），壁纸/渐变上不铺以免出现可见色块。
+                surfaceColor = TextSurfacePolicy.ShouldPaint(edit, windowOf.ContainsKey(element.Id)) ? background.Css : null;
                 var textPadding = box == null
                     ? 0
                     : Math.Max(Math.Max(box.Top.Width, box.Right.Width), Math.Max(box.Bottom.Width, box.Left.Width)) + 2;
+                // 单行文本先量一次真实墨迹高度：用来判断 provider 报的“磅值”其实是像素。
+                // 多行区域（文档正文）不参与，避免把整段高度当成一行字高。
+                RectInt? inkHint = null;
+                if (!edit && element.H > 0 && element.H <= 40)
+                {
+                    var hintReach = (int)Math.Ceiling(element.H * scale * 0.5);
+                    var hintTop = Math.Max(0, region.Y - hintReach);
+                    var hintBottom = region.Y + region.Height + hintReach;
+                    inkHint = RegionStyleAnalyzer.InkBounds(
+                        capture.Frame,
+                        new RectInt(region.X, hintTop, region.Width, Math.Max(1, hintBottom - hintTop)),
+                        background,
+                        textPadding);
+                }
                 // 选中态的文字是反色画出来的，像素里没有原色；按底色明度选一个可读的正文色。
                 color = selected
                     ? RegionStyleAnalyzer.PreferredTextColor(background).Css
@@ -242,11 +292,37 @@ public static class DesktopPayload
                             : RegionStyleAnalyzer.EstimateFontSize(capture.Frame, region, background, textPadding, content) is int estimate
                                 ? estimate / scale
                                 : 14;
+                if (uia?.FontSizePoints is double reported)
+                {
+                    // 有的 provider 把像素当磅返回：换算后字高超过真实墨迹时按像素处理。
+                    // 用墨迹高度而不是控件高度，状态栏里“纯文本”这类带上下留白的项才判断得准。
+                    var limit = inkHint is RectInt hint && hint.Height >= TextPlacement.MinInk
+                        ? hint.Height / scale
+                        : element.H;
+                    pixels = TextPlacement.NormalizeFontSize(pixels, reported, limit);
+                }
                 fontSize = Math.Clamp(Math.Round(pixels * 2, MidpointRounding.AwayFromZero) / 2, 8, 96);
                 lineHeight = Math.Round(fontSize.Value * 1.3, 1, MidpointRounding.AwayFromZero);
                 fontFamily = uia?.FontFamily ?? win32?.Family ?? fit?.Family ?? "\"Segoe UI\",\"Microsoft YaHei\",system-ui,sans-serif";
-                fontWeight = (uia?.FontWeight ?? win32?.Weight ?? fit?.Weight ?? 400).ToString();
+                var weight = uia?.FontWeight ?? win32?.Weight ?? fit?.Weight;
+                if (weight == null)
+                {
+                    // 主路径也可能只有字体族和字号而缺字重；沿用 IA2 的像素分类，避免一律回退 400。
+                    // 已有 provider 或 Fit 字重时不覆盖，只有全部缺失才增加这次像素与 GDI 度量。
+                    weight = FontFitter.ClassifyWeightFromInk(
+                        capture.Frame,
+                        region,
+                        background,
+                        textPadding,
+                        content,
+                        uia?.FontFamily ?? win32?.Family ?? fit?.Family ?? "Segoe UI",
+                        fontSize.Value,
+                        scale);
+                }
+                fontWeight = (weight ?? 400).ToString();
                 fontStyle = (uia?.Italic ?? win32?.Italic) == true ? "italic" : null;
+                // 单行控件（状态栏、标签）里的换行只代表分段：折叠成空格，否则 pre-wrap 会排成两行并被裁掉。
+                if (!edit && element.H <= lineHeight.Value * 1.8) content = TextPlacement.CollapseLine(content);
                 spans = BuildSpans(element.Sensitive ? null : uia?.Spans, content, fontFamily, fontSize, fontWeight, fontStyle, color);
                 // 单行输入框的正文是垂直居中的行盒，不是铺满整个控件矩形。
                 if (edit && element.H <= lineHeight.Value * 2.2)
@@ -257,6 +333,38 @@ public static class DesktopPayload
                     w = Math.Max(1, w - padding * 2);
                     y += Math.Max(0, (element.H - line) / 2);
                     h = Math.Min(element.H, line);
+                }
+                else
+                {
+                    // UIA 的元素矩形通常含内边距，直接左对齐会让文字整体偏左偏上；按像素墨迹校正落位。
+                    // 多行区域只探测顶部两行：整块扫描会把滚动条、边框等暗像素也当成文字。
+                    // 向上多探半行：控件矩形上缘常切掉笔画顶部，探测区不扩会量到偏低的墨迹。
+                    var reach = (int)Math.Ceiling(fontSize.Value * scale * 0.4);
+                    var probeTop = Math.Max(0, region.Y - reach);
+                    var probeBottom = region.Y + Math.Min(
+                        region.Height,
+                        (int)Math.Ceiling(lineHeight.Value * scale * 2.5));
+                    var probe = new RectInt(
+                        region.X,
+                        probeTop,
+                        region.Width,
+                        Math.Max(1, probeBottom - probeTop));
+                    var ink = RegionStyleAnalyzer.InkBounds(capture.Frame, probe, background, textPadding);
+                    var row = LineOf(uia, physicalById.TryGetValue(element.Id, out var ownInfo) ? ownInfo : null);
+                    var placed = TextPlacement.Align(
+                        ink,
+                        row is RectInt absolute ? RelativeToCapture(absolute, capture.WorkArea) : null,
+                        new PlacedText(x, y, w, h),
+                        scale,
+                        lineHeight.Value,
+                        fontSize.Value,
+                        useInkY: !sharedLines.Contains(element.Id));
+                    x = placed.X;
+                    y = placed.Y;
+                    w = placed.W;
+                    h = placed.H;
+                    // 单行文本的最终宽度由渲染层按真实字体实测后收窄/补足，这里不再用字符数粗估，
+                    // 避免浅灰无墨迹文本被撑宽后侵入同一行的下一个片段。
                 }
             }
 
@@ -281,6 +389,7 @@ public static class DesktopPayload
                 fontWeight,
                 fontStyle,
                 spans,
+                surfaceColor,
                 sensitive = element.Sensitive,
             });
             if (client is { } clientArea)
@@ -409,7 +518,8 @@ public static class DesktopPayload
         if (!string.Equals(NormalizeText(joined), NormalizeText(content), StringComparison.Ordinal)) return null;
         return runs.Select(run => (object)new
         {
-            text = run.Text,
+            // span 内部的控制字符要一并规范化，否则渲染层会真的换行，把单行状态栏裁成两行。
+            text = NormalizeText(run.Text),
             fontFamily = run.Style.FontFamily ?? family,
             fontSize = run.Style.FontSizePoints is double points
                 ? Math.Clamp(Math.Round(points * 96 / 72 * 2, MidpointRounding.AwayFromZero) / 2, 8, 96)
@@ -422,6 +532,68 @@ public static class DesktopPayload
 
     private static string NormalizeText(string value) =>
         value.Replace('\r', ' ').Replace('\n', ' ').Trim();
+
+    /// <summary>
+    /// IA2 行元素：落位与宽度来自逐字符矩形，样式取自 attributes()。
+    /// 标成 exact 后渲染层不再按右邻夹紧、也不再并入合并行，避免二次拟合破坏字符间距。
+    /// </summary>
+    private static object Ia2Element(CapturedScreen capture, DesktopElement element, Ia2Line line, UiaTextStyle? uia, bool hasWindowOwner)
+    {
+        var scale = capture.Mapper.CssScale;
+        var box = RelativeToCapture(line.Bounds, capture.WorkArea);
+        var style = line.Style;
+        var pixels = style?.FontSizePx is double size && size > 0 ? size : 14;
+        var fontSize = Math.Clamp(Math.Round(pixels * 2, MidpointRounding.AwayFromZero) / 2, 8, 96);
+        // IA2 直接给出该行文字的真实背景色：与底座截图同色，铺上既能让 Chromium 重新启用 ClearType，
+        // 又能盖住底座里的原文消除双绘加粗，且不会留下可见色块。IA2 未给背景色时回退像素主色，
+        // 并复用与主路径一致的铺色策略，避免在壁纸/渐变上铺出错色块。
+        var background = ParseRgbCss(style?.BackgroundCss);
+        string? surfaceColor = style?.BackgroundCss;
+        if (surfaceColor == null || background == null)
+        {
+            var dominant = RegionStyleAnalyzer.DominantColor(capture.Frame, box);
+            if (surfaceColor == null)
+                surfaceColor = TextSurfacePolicy.ShouldPaint(isEdit: false, hasWindowOwner) ? dominant.Css : null;
+            background ??= dominant;
+        }
+        // Chromium 的 IA2 attributes() 不返回 font-weight（style.Bold 恒为 null），导致所有 IA2 文字被画成 400；
+        // 用截图像素笔画宽度 + GDI 真实 x-height 归一化成笔画比，选最接近的 Light/Regular/Bold 先验。
+        // 不依赖 fit 的字号反解（中文长文本宽度拟合常失败），只判字重；量不到或误差过大时回退 400。
+        int? classified = null;
+        if (style?.Bold == null && background is Rgb bg && box.Width >= 4 && box.Height >= 4)
+        {
+            var ink = RegionStyleAnalyzer.InkBounds(capture.Frame, box, bg, 0);
+            if (ink is RectInt ib && ib.Width >= 4 && ib.Height >= 4)
+            {
+                var stroke = RegionStyleAnalyzer.StrokeWidth(capture.Frame, ib, bg);
+                if (stroke is double s && s > 0)
+                {
+                    classified = FontFitter.ClassifyWeightFromInk(line.Text, style?.FontFamily ?? "Segoe UI", s, pixels, scale);
+                }
+            }
+        }
+        var weight = style?.Bold == true ? 700 : classified ?? uia?.FontWeight ?? 400;
+        return new
+        {
+            id = $"{element.Id}:ia2:{box.X}:{box.Y}",
+            parent = element.Parent,
+            kind = "text",
+            x = box.X / scale,
+            y = box.Y / scale,
+            w = box.Width / scale,
+            h = box.Height / scale,
+            semantic = element.Semantic,
+            text = line.Text,
+            color = style?.ColorCss ?? uia?.ColorCss ?? "rgb(32,32,32)",
+            fontSize,
+            lineHeight = Math.Round(fontSize * 1.3, 1, MidpointRounding.AwayFromZero),
+            fontFamily = style?.FontFamily ?? uia?.FontFamily ?? "\"Segoe UI\",\"Microsoft YaHei\",system-ui,sans-serif",
+            fontWeight = weight.ToString(),
+            fontStyle = (style?.Italic ?? uia?.Italic) == true ? "italic" : null,
+            surfaceColor,
+            exact = true,
+        };
+    }
 
     /// <summary>
     /// Tier B 的入口：从截图取该元素真实墨迹的宽、高与笔画宽度，交给度量反解。
@@ -444,6 +616,20 @@ public static class DesktopPayload
             : null;
     }
 
+    /// <summary>解析 IA2 attributes() 给的 "rgb(r,g,b)" 背景色，失败返回 null。</summary>
+    private static Rgb? ParseRgbCss(string? css)
+    {
+        if (string.IsNullOrWhiteSpace(css)) return null;
+        var open = css.IndexOf('(');
+        var close = css.IndexOf(')');
+        if (open < 0 || close < 0 || close < open) return null;
+        var inner = css.Substring(open + 1, close - open - 1);
+        var parts = inner.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 3) return null;
+        if (!byte.TryParse(parts[0], out var r) || !byte.TryParse(parts[1], out var g) || !byte.TryParse(parts[2], out var b)) return null;
+        return new Rgb(r, g, b);
+    }
+
     private static bool InsideImage(
         string id,
         IReadOnlyDictionary<string, string?> parentById,
@@ -456,6 +642,29 @@ public static class DesktopPayload
             current = parent;
         }
         return false;
+    }
+
+    /// <summary>
+    /// 选取与该元素框相交的行矩形。多行 provider 会给每行一个矩形，取垂直重叠最多的一行；
+    /// 重叠相同时保留阅读顺序里的第一行（元素顶部那一行）。
+    /// </summary>
+    private static RectInt? LineOf(UiaTextStyle? uia, UiaElementInfo? physical)
+    {
+        if (uia?.Lines is not { Count: > 0 } lines || physical == null) return null;
+        var box = physical.Bounds;
+        RectInt? best = null;
+        var bestOverlap = 0;
+        foreach (var line in lines)
+        {
+            if (line.Width <= 0 || line.Height <= 0) continue;
+            var vertical = Math.Min(box.Bottom, line.Bottom) - Math.Max(box.Y, line.Y);
+            if (vertical <= bestOverlap) continue;
+            var horizontal = Math.Min(box.Right, line.Right) - Math.Max(box.X, line.X);
+            if (horizontal <= 0) continue;
+            bestOverlap = vertical;
+            best = line;
+        }
+        return best;
     }
 
     /// <summary>取元素自己的原生窗口句柄；纯 UIA 元素（无 HWND）返回 0。</summary>

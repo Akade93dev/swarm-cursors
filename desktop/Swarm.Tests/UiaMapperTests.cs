@@ -51,6 +51,22 @@ public class UiaMapperTests
     }
 
     [Fact]
+    public void 含子级的文档不输出容器值但保留后代文本()
+    {
+        var elements = new[]
+        {
+            new UiaElementInfo { Id = "doc", ControlType = "Document", Value = "container-value", Bounds = new RectInt(0, 0, 800, 600), ProcessId = 42, HasVisual = true },
+            new UiaElementInfo { Id = "group", ParentId = "doc", ControlType = "Group", Bounds = new RectInt(0, 0, 800, 600), ProcessId = 42, HasVisual = true },
+            new UiaElementInfo { Id = "body", ParentId = "group", ControlType = "Text", Name = "实际正文", Bounds = new RectInt(20, 40, 200, 24), ProcessId = 42, HasVisual = true },
+        };
+
+        var result = UiaMapper.Map(elements, 800, 600);
+
+        Assert.DoesNotContain(result, item => item.Id == "doc");
+        Assert.Contains(result, item => item.Id == "body" && item.Kind == "text" && item.Text == "实际正文");
+    }
+
+    [Fact]
     public void 离屏文本即使有名字也不进入重建()
     {
         var elements = new[]

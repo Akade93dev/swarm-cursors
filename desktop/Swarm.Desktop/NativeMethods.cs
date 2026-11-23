@@ -77,6 +77,23 @@ internal static class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool GetWindowRect(nint hWnd, out Win32Rect lpRect);
 
+    /// <summary>DWMWA_EXTENDED_FRAME_BOUNDS：不含不可见调整边框的可见窗口矩形。</summary>
+    private const int DwmwaExtendedFrameBounds = 9;
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmGetWindowAttribute(nint hWnd, int attribute, out Win32Rect value, int size);
+
+    /// <summary>
+    /// 取与屏幕可见内容对齐的窗口矩形：GetWindowRect 含约 7–11px 的不可见调整边框，
+    /// 而 WGC 帧从可见边框开始，直接用 GetWindowRect 裁剪会让客户区偏出若干像素。
+    /// </summary>
+    internal static bool TryGetVisibleWindowRect(nint window, out Win32Rect rect)
+    {
+        if (DwmGetWindowAttribute(window, DwmwaExtendedFrameBounds, out rect, Marshal.SizeOf<Win32Rect>()) == 0)
+            return true;
+        return GetWindowRect(window, out rect);
+    }
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool GetClientRect(nint hWnd, out Win32Rect lpRect);
@@ -207,6 +224,14 @@ internal static class NativeMethods
     internal const int WhMouseLl = 14;
     internal const int WmLButtonDown = 0x0201;
     internal const int WmLButtonUp = 0x0202;
+    internal const int WmRButtonDown = 0x0204;
+    internal const int WmRButtonUp = 0x0205;
+    internal const int WmMButtonDown = 0x0207;
+    internal const int WmMButtonUp = 0x0208;
+    internal const int WmMouseWheel = 0x020A;
+    internal const int WmXButtonDown = 0x020B;
+    internal const int WmXButtonUp = 0x020C;
+    internal const int WmMouseHWheel = 0x020E;
     internal const int WmKeyDown = 0x0100;
     internal const int WmKeyUp = 0x0101;
     internal const int WmSysKeyDown = 0x0104;

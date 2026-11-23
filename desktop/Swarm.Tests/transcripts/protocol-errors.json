@@ -1,0 +1,59 @@
+{
+  "name": "protocol-errors",
+  "steps": [
+    {
+      "send": {"jsonrpc":"2.0","id":7,"method":"resources/list"},
+      "expect": {
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 7,
+          "error": {"code": -32601, "message": "Method not found"}
+        }
+      }
+    },
+    {
+      "send": {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"delete_everything","arguments":{}}},
+      "expect": {
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 8,
+          "error": {"code": -32602, "message": "Invalid params", "data": "Unknown tool: delete_everything"}
+        }
+      }
+    },
+    {
+      "send": {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"arguments":{}}},
+      "expect": {
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 9,
+          "error": {"code": -32602, "message": "Invalid params", "data": "tools/call requires a tool name."}
+        }
+      }
+    },
+    {
+      "send": {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"observe","arguments":[]}},
+      "expect": {
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 10,
+          "error": {"code": -32602, "message": "Invalid params", "data": "Tool arguments must be a JSON object."}
+        }
+      }
+    },
+    {
+      "send": {"jsonrpc":"1.0","id":11,"method":"ping"},
+      "expect": {
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 11,
+          "error": {"code": -32600, "message": "Invalid Request"}
+        }
+      }
+    },
+    {
+      "send": {"jsonrpc":"2.0","method":"resources/list"},
+      "expect": {}
+    }
+  ]
+}
