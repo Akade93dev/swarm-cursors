@@ -56,8 +56,19 @@ public sealed class McpGateway
                     case "notifications/cancelled":
                         await CancelRequest(root);
                         return null;
-                    case "initialize":
-                        return hasId ? RpcResult(id, InitializeResult(root)) : null;
+                    case "initialize": {
+                        var negotiated = NegotiateInitialProtocol(root, out var modernRequested);
+                        if (modernRequested && negotiated == FallbackProtocolVersion)
+                        {
+                            // modern 客户端显式声明了不支持的版本 → -32022 (预协商失败).
+                            // legacy params.protocolVersion 顶层永远走 fallback.
+                            return hasId
+                                ? RpcError(id, -32022, "Unsupported protocol version",
+                                    $"Requested version not in [{string.Join(", ", SupportedProtocolVersions)}].")
+                                : null;
+                        }
+                        return hasId ? RpcResult(id, InitializeResult(negotiated)) : null;
+                    }
                     case "server/discover":
                         return hasId ? RpcResult(id, DiscoverResult()) : null;
                     case "ping":
@@ -278,6 +289,9 @@ public sealed class McpGateway
                     prompt = $"Confirm {actionLabel}. Pass confirmToken back with the same action.",
                     expiresInMs = 5_000,
                 },
+                // P1-P 补充: ttlMs 让客户端知道结果有效窗口; cacheScope 声明结果可缓存粒度.
+                ttlMs = 120_000,
+                cacheScope = "per_task",
             };
         }
 
@@ -287,6 +301,8 @@ public sealed class McpGateway
             resultType = "success",
             structuredContent = ExtractStructuredContent(result),
             content = legacyContent,
+            ttlMs = 120_000,
+            cacheScope = "per_observe",
         };
     }
 
@@ -309,6 +325,8 @@ public sealed class McpGateway
             structuredContent = legacy.structuredContent,
             content = legacy.content,
             isError = legacy.isError,
+            ttlMs = 0,                    // blocked 结果不缓存
+            cacheScope = "never",
         };
     }
 
@@ -391,18 +409,41 @@ public sealed class McpGateway
     private const string FallbackProtocolVersion = "2024-11-05";
     private const string ModernProtocolVersion = "2025-06-18";
 
-    private static object InitializeResult(JsonElement root)
+    /// <summary>
+    /// 从 initialize params.protocolVersion 协商协议版本.
+    /// 返回 supported 版本或 fallback.
+    /// modernRequested=true 表示 params._meta.protocolVersion 显式声明了 (仅 modern 客户端会带),
+    /// 这时 initialize switch 会在不支持时返回 -32022.
+    /// params 顶层 protocolVersion 属于 legacy 容错, 永远 fallback (不触发 -32022).
+    /// </summary>
+    private static string NegotiateInitialProtocol(JsonElement root, out bool modernRequested)
     {
-        var requested = root.TryGetProperty("params", out var parameters) &&
+        modernRequested = false;
+        // modern 客户端: params._meta.protocolVersion (2025-06-18 MRTR 约定)
+        if (root.TryGetProperty("params", out var parameters) && parameters.ValueKind == JsonValueKind.Object &&
+            parameters.TryGetProperty("_meta", out var meta) && meta.ValueKind == JsonValueKind.Object &&
+            meta.TryGetProperty("protocolVersion", out var metaVer) && metaVer.ValueKind == JsonValueKind.String)
+        {
+            var mv = metaVer.GetString();
+            if (mv is not null && Array.IndexOf(SupportedProtocolVersions, mv) >= 0) return mv;
+            modernRequested = true;
+            return FallbackProtocolVersion;
+        }
+        // legacy: params.protocolVersion (顶层), 不支持就静默 fallback
+        var requested = root.TryGetProperty("params", out parameters) &&
             parameters.ValueKind == JsonValueKind.Object &&
             parameters.TryGetProperty("protocolVersion", out var version) &&
             version.ValueKind == JsonValueKind.String
                 ? version.GetString()
                 : null;
-        // 支持则原样回显；不支持时返回己方支持的版本（当前只有 2024-11-05）。
-        var negotiated = requested is not null && Array.IndexOf(SupportedProtocolVersions, requested) >= 0
+        if (requested is null) return FallbackProtocolVersion;
+        return Array.IndexOf(SupportedProtocolVersions, requested) >= 0
             ? requested
             : FallbackProtocolVersion;
+    }
+
+    private static object InitializeResult(string negotiated)
+    {
         return new
         {
             protocolVersion = negotiated,
