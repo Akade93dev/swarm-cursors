@@ -98,10 +98,11 @@ public static class HierarchicalScreenParser
         var candidates = new List<Layer2Candidate>();
 
         // UIA interactives 优先 (有 UIA 信号更准)
+        var uiaCandidates = new List<Layer2Candidate>();
         foreach (var u in interactives.Where(i => i.W > 0 && i.H > 0))
         {
             var kind = u.UiaControlType != null && InteractiveMap.TryGetValue(u.UiaControlType, out var k) ? k : SetOfMarkBuilder.ClassifyStatic(u.Text);
-            candidates.Add(new Layer2Candidate(
+            uiaCandidates.Add(new Layer2Candidate(
                 SourceId: u.SourceId,
                 Text: u.Text,
                 X: u.X, Y: u.Y, W: u.W, H: u.H,
@@ -111,13 +112,14 @@ public static class HierarchicalScreenParser
                 FromOcrOnly: false));
         }
 
-        // OCR lines 追加 (只加不与 UIA 重叠的, 避免重复)
+        // OCR lines 追加 (只加不与 UIA 重叠的, 避免重复; OCR 内部去重交给 MergeOverlappingLayer2)
         foreach (var o in ocrLines)
         {
             if (o.Confidence < 0.80) continue;
             if (IsPunctuationOnly(o.Text)) continue;
             if (o.Text.Trim().Length == 0) continue;
-            if (OverlapsAnyUia(candidates, o.X, o.Y, o.Width, o.Height)) continue;
+            // 只检查 UIA candidates, 不检查已经加入的 OCR candidates (那是 MergeOverlappingLayer2 的职责)
+            if (OverlapsAnyUia(uiaCandidates, o.X, o.Y, o.Width, o.Height)) continue;
             var kind = SetOfMarkBuilder.ClassifyStatic(o.Text);
             if (kind == SoMKind.Paragraph) continue;
             candidates.Add(new Layer2Candidate(
@@ -129,6 +131,9 @@ public static class HierarchicalScreenParser
                 UiaControlType: null,
                 FromOcrOnly: true));
         }
+
+        // 把 UIA candidates 和 OCR candidates 合并 (UIA 先加, MergeOverlappingLayer2 会处理重叠)
+        candidates.InsertRange(0, uiaCandidates);
 
         // 合并 Layer 2 内部重叠 (贪心)
         var merged = MergeOverlappingLayer2(candidates);
