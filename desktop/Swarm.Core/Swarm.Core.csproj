@@ -8,6 +8,8 @@
 
   <ItemGroup>
     <PackageReference Include="DocumentFormat.OpenXml" Version="3.1.0" />
+    <!-- OpenXml 3.1.0 传递依赖 System.IO.Packaging 8.0.0（NU1903 高危，GHSA-qj66-m88j-hmgj / GHSA-f32c-w444-8ppv），显式升到已修复版本。 -->
+    <PackageReference Include="System.IO.Packaging" Version="10.0.15" />
   </ItemGroup>
 
 </Project>
