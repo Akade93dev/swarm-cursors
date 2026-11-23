@@ -51,17 +51,21 @@ public static class UiaMapper
     public static IReadOnlyList<DesktopElement> Map(IEnumerable<UiaElementInfo> elements, double viewportWidth, double viewportHeight)
     {
         var viewport = new RectInt(0, 0, (int)Math.Ceiling(viewportWidth), (int)Math.Ceiling(viewportHeight));
+        var source = elements as IReadOnlyCollection<UiaElementInfo> ?? elements.ToList();
+        var containers = source.Where(item => item.ParentId != null).Select(item => item.ParentId!).ToHashSet(StringComparer.Ordinal);
         var included = new HashSet<string>();
         var result = new List<DesktopElement>();
-        foreach (var element in elements)
+        foreach (var element in source)
         {
             if (!element.Bounds.Intersects(viewport)) continue;
             var text = element.Value ?? element.Name;
+            var isDocument = element.ControlType.Equals("Document", StringComparison.OrdinalIgnoreCase);
             var isText = element.ControlType.Equals("Text", StringComparison.OrdinalIgnoreCase)
                 || element.ControlType.Equals("Edit", StringComparison.OrdinalIgnoreCase)
-                || element.ControlType.Equals("Document", StringComparison.OrdinalIgnoreCase);
+                || isDocument;
             DesktopElement? mapped = null;
-            if (isText && element.HasVisual && !string.IsNullOrWhiteSpace(text))
+            // 容器 Document 的 Value 常是文档 URL，不是可见正文；叶级 Document 仍保留原映射。
+            if (isText && !(isDocument && containers.Contains(element.Id)) && element.HasVisual && !string.IsNullOrWhiteSpace(text))
             {
                 mapped = new DesktopElement
                 {

@@ -21,6 +21,13 @@ public enum OperationStatus
     Canceled,
 }
 
+public enum OperationVerificationStatus
+{
+    NotRequested,
+    Passed,
+    Unverified,
+}
+
 /// <summary>实际生效的输入通道：UIA 模式、定向窗口消息、全局输入。</summary>
 public enum InputTier
 {
@@ -39,6 +46,8 @@ public sealed class OperationStep
     public OperationStatus Status { get; private set; } = OperationStatus.Pending;
     public InputTier Tier { get; private set; } = InputTier.None;
     public bool Verified { get; private set; }
+    public OperationVerificationStatus Verification { get; private set; } = OperationVerificationStatus.NotRequested;
+    public string? Evidence { get; private set; }
     public string? Note { get; private set; }
     public DateTimeOffset? StartedAt { get; private set; }
     public DateTimeOffset? EndedAt { get; private set; }
@@ -60,11 +69,17 @@ public sealed class OperationStep
         _ => OperationKind.Custom,
     };
 
-    /// <summary>由执行体在完成前回填，供覆盖层显示通道与是否可验证。</summary>
-    public void ReportTransport(InputTier tier, bool verified, string? note = null)
+    /// <summary>由执行体在完成前回填，供覆盖层显示通道与独立验证证据。</summary>
+    public void ReportTransport(InputTier tier, bool verified, string? note = null, string? evidence = null)
     {
         Tier = tier;
         Verified = verified;
+        Verification = verified
+            ? OperationVerificationStatus.Passed
+            : evidence == null
+                ? OperationVerificationStatus.NotRequested
+                : OperationVerificationStatus.Unverified;
+        Evidence = evidence;
         Note = string.IsNullOrWhiteSpace(note) ? null : note;
     }
 
@@ -106,7 +121,9 @@ public sealed record OperationStepView(
     double? DurationMs,
     InputTier Tier = InputTier.None,
     bool Verified = false,
-    string? Note = null);
+    string? Note = null,
+    OperationVerificationStatus Verification = OperationVerificationStatus.NotRequested,
+    string? Evidence = null);
 
 /// <summary>操作事件：session-start、step、session-end。带会话 id、序号与阶段，渲染层据此丢弃过期事件。</summary>
 public sealed record OperationEvent(

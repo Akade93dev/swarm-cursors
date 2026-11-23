@@ -21,6 +21,8 @@ public enum RebuildFallbackReason
     NoElements,
     EmptyMapped,
     SparseSemantics,
+    /// <summary>只有窗口外壳可读（Chromium/Electron）：保留底座原像素，仅重建框架。</summary>
+    FrameOnly,
     ShellDesktop,
 }
 
@@ -29,8 +31,9 @@ public sealed record RebuildDecision(
     RebuildFallbackReason Reason,
     int NamedControls,
     int Elements,
-    bool Truncated)
+    UiaTruncationReason Truncation)
 {
+    public bool Truncated => Truncation is not UiaTruncationReason.None;
     public bool IsFallback => Mode == RebuildMode.Screenshot;
 }
 
@@ -60,7 +63,7 @@ public static class RebuildStrategy
 
     /// <summary>桌面强制截屏的固定决策，避免为壁纸白花一次 3 秒的 UIA 遍历。</summary>
     public static RebuildDecision ShellDesktop() =>
-        new(RebuildMode.Screenshot, RebuildFallbackReason.ShellDesktop, 0, 0, false);
+        new(RebuildMode.Screenshot, RebuildFallbackReason.ShellDesktop, 0, 0, UiaTruncationReason.None);
 
     public static RebuildDecision Decide(
         IReadOnlyList<UiaElementInfo> elements,
@@ -70,11 +73,17 @@ public static class RebuildStrategy
     {
         if (shellDesktop) return ShellDesktop();
         var named = CountNamed(elements);
-        var truncated = truncation != UiaTruncationReason.None;
-        if (elements.Count == 0) return new(RebuildMode.Screenshot, RebuildFallbackReason.NoElements, 0, 0, truncated);
-        if (mapped.Count == 0) return new(RebuildMode.Screenshot, RebuildFallbackReason.EmptyMapped, named, 0, truncated);
-        if (named < MinNamedControls) return new(RebuildMode.Screenshot, RebuildFallbackReason.SparseSemantics, named, mapped.Count, truncated);
-        return new(RebuildMode.Semantic, RebuildFallbackReason.None, named, mapped.Count, truncated);
+        if (elements.Count == 0) return new(RebuildMode.Screenshot, RebuildFallbackReason.NoElements, 0, 0, truncation);
+        if (mapped.Count == 0) return new(RebuildMode.Screenshot, RebuildFallbackReason.EmptyMapped, named, 0, truncation);
+        if (named < MinNamedControls)
+        {
+            // Chromium/Electron 只暴露窗口外壳：整窗截图会让画面与原来完全一致（看起来没触发），
+            // 改为框架重建——内容保留底座像素，只对标题栏和按钮做语义化落位与动画。
+            return mapped.Any(element => element.Semantic == "window")
+                ? new(RebuildMode.Semantic, RebuildFallbackReason.FrameOnly, named, mapped.Count, truncation)
+                : new(RebuildMode.Screenshot, RebuildFallbackReason.SparseSemantics, named, mapped.Count, truncation);
+        }
+        return new(RebuildMode.Semantic, RebuildFallbackReason.None, named, mapped.Count, truncation);
     }
 
     public static int CountNamed(IEnumerable<UiaElementInfo> elements) => elements.Count(IsNamed);

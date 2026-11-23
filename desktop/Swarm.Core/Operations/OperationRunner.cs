@@ -60,6 +60,12 @@ public sealed class OperationRunner
 
     public void EndSession() => EndSessionCore(null);
 
+    public void ReportControl(string status)
+    {
+        var session = Session;
+        if (session != null) Emit("control", session, status: status, phase: "control");
+    }
+
     /// <summary>
     /// 停止会话：禁止新步骤 → 取消会话令牌 → 等待在飞步骤（默认 800ms）→ 发出 session-end。
     /// 保证步骤的结束事件早于 session-end，避免渲染层面板复活或状态错乱。
@@ -117,6 +123,7 @@ public sealed class OperationRunner
             _inflight[step.Id] = registration;
         }
 
+        Emit("step", session, View(step), phase: "plan");
         step.Start();
         Emit("step", session, View(step), phase: "start");
 
@@ -270,5 +277,5 @@ public sealed class OperationRunner
     }
 
     private static OperationStepView View(OperationStep step) =>
-        new(step.Id, step.Kind, step.Label, step.Status, step.Error, step.DurationMs, step.Tier, step.Verified, step.Note);
+        new(step.Id, step.Kind, step.Label, step.Status, step.Error, step.DurationMs, step.Tier, step.Verified, step.Note, step.Verification, step.Evidence);
 }

@@ -1,3 +1,6 @@
+using Swarm.Core.Capture;
+using Swarm.Core.Semantics;
+
 namespace Swarm.Core.Visual;
 
 /// <summary>
@@ -60,6 +63,7 @@ public sealed class FontMetricFitter
     /// 笔画宽度比先验。文献值是渲染前的 8%–12% / 18%–25%，但截图上按“核心像素”量到的
     /// GDI 笔画含半像素取整，实测常规 ≈15%、粗体 ≈30%，这里用校准后的值。
     /// </summary>
+    private const double LightStrokeRatio = 0.10;
     private const double RegularStrokeRatio = 0.15;
     private const double BoldStrokeRatio = 0.30;
 
@@ -89,6 +93,58 @@ public sealed class FontMetricFitter
 
     /// <summary>Tier C 与 Tier B 共用的字重阈值：笔画宽 / x-height ≥ 0.22 视为粗体（核心像素口径）。</summary>
     public static int ClassifyWeight(double strokeRatio) => strokeRatio >= 0.22 ? 700 : 400;
+
+    /// <summary>
+    /// 从文字区域提取墨迹与核心笔画，再按既定字体族和字号分类字重。
+    /// 主路径在 UIA、Win32 与 Fit 都缺字重时使用；墨迹不足时返回 null，交由调用方回退。
+    /// </summary>
+    public int? ClassifyWeightFromInk(
+        RgbaFrame frame,
+        RectInt region,
+        Rgb background,
+        int padding,
+        string? text,
+        string family,
+        double fontSizeCss,
+        double dpiScale)
+    {
+        if (string.IsNullOrWhiteSpace(text) || region.Width < 4 || region.Height < 4) return null;
+        var ink = RegionStyleAnalyzer.InkBounds(frame, region, background, padding);
+        if (ink is not RectInt box || box.Width < 4 || box.Height < 4) return null;
+        var stroke = RegionStyleAnalyzer.StrokeWidth(frame, box, background);
+        return stroke is double width
+            ? ClassifyWeightFromInk(text, family, width, fontSizeCss, dpiScale)
+            : null;
+    }
+
+    /// <summary>
+    /// IA2 路径专用字重分类：字体族与字号已由 IA2 给出，只需从截图像素笔画宽度推断字重。
+    /// 与 Fit 不同，这里不做字号/族反解——中文长文本的宽度拟合常因字间距失败，
+    /// 但笔画宽度与 x-height 的比值不受影响，用 GDI 真实 x-height 归一化后选最接近的先验即可。
+    /// 没有 Light 变体的字体族（非 Segoe UI）不返回 300，避免渲染层写 font-weight:300 却无对应字形。
+    /// 度量失败或误差过大时返回 null，调用方回退，宁可不改也不乱判。
+    /// </summary>
+    public int? ClassifyWeightFromInk(string text, string family, double strokePhysical, double fontSizeCss, double dpiScale)
+    {
+        if (string.IsNullOrWhiteSpace(text) || strokePhysical <= 0 || fontSizeCss <= 0 || dpiScale <= 0) return null;
+        var probe = _source.Measure(text, family, 400, false);
+        if (probe.Width <= 0 || probe.XHeight <= 0) return null;
+        var scale = fontSizeCss * dpiScale / 100.0;
+        if (scale <= 0) return null;
+        var ratio = strokePhysical / (probe.XHeight * scale);
+        var hasLight = family.Equals("Segoe UI", StringComparison.OrdinalIgnoreCase);
+        var best = 400;
+        var bestErr = Math.Abs(ratio - RegularStrokeRatio);
+        if (hasLight)
+        {
+            var e = Math.Abs(ratio - LightStrokeRatio);
+            if (e < bestErr) { best = 300; bestErr = e; }
+        }
+        var boldErr = Math.Abs(ratio - BoldStrokeRatio);
+        if (boldErr < bestErr) { best = 700; bestErr = boldErr; }
+        // 离最近先验仍太远说明笔画测量异常，回退交由调用方处理。
+        return bestErr <= 0.08 ? best : null;
+    }
 
     public FontFitResult? Fit(FontFitRequest request, IReadOnlyList<FontCandidate>? candidates = null)
     {
@@ -120,7 +176,9 @@ public sealed class FontMetricFitter
             if (probe.XHeight > 0)
             {
                 var ratio = stroke / (probe.XHeight * scale);
-                var prior = candidate.Weight >= 600 ? BoldStrokeRatio : RegularStrokeRatio;
+                var prior = candidate.Weight < 400 ? LightStrokeRatio
+                    : candidate.Weight >= 600 ? BoldStrokeRatio
+                    : RegularStrokeRatio;
                 ratioError = Math.Abs(ratio - prior);
             }
             var facePenalty = IsUiFamily(candidate.Family) ? 0 : OtherFacePenalty;
@@ -168,6 +226,7 @@ public sealed class FontMetricFitter
     /// <summary>系统默认 UI 字体不额外惩罚，其余候选加固定惩罚，避免冷门字体靠巧合胜出。</summary>
     private static bool IsUiFamily(string family) =>
         family.Equals("Segoe UI", StringComparison.OrdinalIgnoreCase) ||
+        family.Equals("Segoe UI Light", StringComparison.OrdinalIgnoreCase) ||
         family.StartsWith("Microsoft YaHei", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsCjkFamily(string family) =>
