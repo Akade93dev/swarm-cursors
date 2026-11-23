@@ -467,7 +467,7 @@ dotnet build SwarmDesktop.sln -c Release -warnaserror
 
 # 3. Test
 dotnet test SwarmDesktop.sln --no-build
-# 期望: 373 通过, 0 失败, 0 警告
+# 期望: 379 通过, 0 失败, 0 警告
 
 # 4. Publish Desktop (WPF app 需 Win10+)
 dotnet publish Swarm.Desktop/Swarm.Desktop.csproj -c Release -o publish-verify/Swarm.Desktop
@@ -503,7 +503,7 @@ dotnet publish Swarm.Gateway/Swarm.Gateway.csproj -c Release -o publish-verify/S
 
 这个 skill 就是本项目视觉选型过程的提炼: 冻结维度 → 证据链 → 决策矩阵 → 反模式 → 测试矩阵 → 执行闭环。新 agent 接手视觉相关任务时, 按此框架执行。
 
-Commit `8a6f1ce` 本地已创建, 网络恢复后 `git push origin chore/net10` 即可。
+当前 HEAD 已推送: `0a1f70e` → `origin/chore/net10`, CI (`.github/workflows/desktop-release.yml`) 全绿。
 
 ---
 
@@ -541,16 +541,72 @@ Commit `8a6f1ce` 本地已创建, 网络恢复后 `git push origin chore/net10` 
 
 8. **PiP Session 隔离 (RDP loopback)** — 本机 Home 版无 RDP/Sandbox/Hyper-V，`IsolationProbe` 只能返回 `soft`；换到 Pro/Enterprise 或独立 VM 后再做
 9. **驱动级多光标 (MouseMux 这类虚拟 HID)** — 属于另一条产品路线，不是本架构的增量
+10. **Chromium 元素失效后的自动重解析** — 页面重渲染后旧 `elementId` 的原生元素失效，当前按协议返回 `needs_foreground`（先 `focus` 再重试）；可改为按 stable path 重新 observe + 重新解析，省掉一次前台切换
 
 ### 不要做（硬约束）
 
 - **不要改 `Swarm.Desktop.csproj` 里的 NuGet 版本** — 已稳定
 - **不要改 `Swarm.Core.csproj` 里的 DocumentFormat.OpenXml 版本** — 已验证
+- **不要删掉 `System.IO.Packaging` 的显式版本** — 它覆盖 OpenXml 3.1.0 传递来的 8.0.0，后者会触发 NU1903 高危告警，在 CI 的 `-warnaserror` 下直接编译失败
 - **不要改 `SoMElement` 里任何默认值** — 保持向后兼容
 - **不要在 Tier A/B 的无锁区域临时加全局锁** — 这正是要移除的东西
 - **不要推翻三层输入策略** — 内部实现完全正确, 问题只在上层调度
 - **不要在 Tier C 之前跳过 `EnsureUserIdleForTierC()`** — 这是"用户无感"的唯一兜底
 - **不要把会话状态写回 `DesktopTaskService` 的单例字段** — 那会让并发能力退化回单会话
+
+---
+
+## 十四、本次交付总结（交接摘要）
+
+### 14.1 起点
+
+怀疑「三个 Gateway 能否真并行」。审计后确认不可能，根因是**四层串行**叠加：
+
+1. 管道 `maxInstances=1`（一次一个请求）
+2. `DesktopTaskService` 单个 `_session` 字段（刚 `task_begin` 就 `already_running`）
+3. 全局 `ActionCoordinator` 信号量，且**持锁跨** 90ms VisualLead + 抓屏 + 240ms 像素验证
+4. `CaptureService` 静态 Gate + 单窗口缓存（只读观察也互斥）
+
+### 14.2 交付物
+
+| 层 | 文件 | 作用 |
+|---|---|---|
+| 会话 | `DesktopSession.cs` | `TaskSession` / `SessionRegistry`，键为 `gatewayProcessId`，容量 `SWARM_MAX_SESSIONS`(默认 3) |
+| 锁 | `Core/Concurrency/LeaseManager.cs` | 严格 FIFO；`WindowLease(hwnd)` → `DisplayLease` 单向；引用计数回收闸门 |
+| 只读 | `CaptureService.cs` / `Core/Concurrency/SingleFlight.cs` | per-(hwnd, generation) 合并、300ms 缓存、写动作世代失效 |
+| 输入 | `InputDispatcher.cs` | Tier A/B/C 分发；Tier C 空闲门控 + 单次 `SendInput` |
+| 不打扰 | `Unobtrusive.cs` / `UiaWatchdog.cs` | `UserPresenceGuard`、`CursorRestore`、UIA 超时熔断（指数退避） |
+| 确认 | `Core/Governance/ConfirmationQueue.cs` + `MainWindow.AskAsync` | 独立 STA 线程原生 MessageBox：非阻塞、不夺焦、可取消 |
+| 并发入口 | `DesktopIpcServer.cs` | 并发 accept，16 连接上限 |
+| 验证 | `ConcurrencyTests.cs` / `e2e/concurrency.ps1` | 6 个并发单测 + 3-Gateway 真并发 E2E |
+| CI | `.github/workflows/desktop-release.yml` | build `-warnaserror` + test + publish；编译错误转 `::error` 注解 |
+
+### 14.3 验证证据
+
+- `dotnet build -c Release -warnaserror`：0 警告 0 错误
+- `dotnet test`：379 通过 / 0 失败
+- 全量 e2e：8 套件（p0-routing、p1-pixels、p1-s-invariants、p2-overlay、edge-pixels、type-focus、edge-tiers、concurrency）**连续两轮全 PASS**
+- CI：run `45148464524`（commit `0a1f70e`）所有步骤 success
+- publish：176.0 MB → 162.9 MB（移除 OnnxRuntime）
+
+### 14.4 能力边界
+
+**能做到**：≤3 会话并行；同窗口严格串行、跨窗口互不阻塞；只读观察合并；AI 借用光标时用户一有输入即让行；用完归位；不抢焦点；确认可取消。
+
+**做不到（已查明原因，非未实现）**：
+- 真正的双光标 —— 需要独立 session 或虚拟 HID；本机 Home 版无 RDP/Hyper-V/Sandbox，`IsolationProbe` = `soft`
+- Chromium 后台窗口直接输入 —— 无可用 ValuePattern，协议要求先 `focus`（见 13-10）
+- 零拷贝抓屏 —— 当前 WGC/共享内存已够用，非最优
+- CI 不跑 e2e —— 依赖真实桌面与前台窗口，托管 runner 上不可靠；「本地能证、CI 不能证」仅此一处
+
+### 14.5 提交记录（均已推送 `origin/chore/net10`）
+
+| commit | 内容 |
+|---|---|
+| `4a3b763` | feat: SERPENT v2 并发架构 + 并发 e2e + CI（26 文件, +2354/−565） |
+| `4c3a2a3` | ci: 编译错误转 `::error` 注解（公开仓库免登录定位） |
+| `0a1f70e` | fix: `System.IO.Packaging` 升 10.0.15，消除 NU1903 |
+| 本次 | docs: HANDOFF 收尾总结（本章） |
 
 ---
 
