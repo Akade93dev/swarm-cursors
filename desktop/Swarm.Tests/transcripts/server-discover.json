@@ -1,0 +1,54 @@
+{
+    "name":  "server-discover-before-initialize",
+    "steps":  [
+                  {
+                      "send":  {
+                                   "method":  "server/discover",
+                                   "id":  42,
+                                   "jsonrpc":  "2.0"
+                               },
+                      "expect":  {
+                                     "response":  {
+                                                      "jsonrpc":  "2.0",
+                                                      "id":  42,
+                                                      "result":  {
+                                                                     "capabilities":  {
+                                                                                          "governance":  {
+                                                                                                             "blockedResult":  true,
+                                                                                                             "confirmToken":  true,
+                                                                                                             "inputRequiredResult":  true,
+                                                                                                             "policy":  true,
+                                                                                                             "redactions":  [
+                                                                                                                                "password",
+                                                                                                                                "credential",
+                                                                                                                                "email",
+                                                                                                                                "id",
+                                                                                                                                "bank",
+                                                                                                                                "phone"
+                                                                                                                            ]
+                                                                                                         },
+                                                                                          "tools":  {
+                                                                                                        "listChanged":  false
+                                                                                                    }
+                                                                                      },
+                                                                     "defaultProtocolVersion":  "2024-11-05",
+                                                                     "endpoints":  [
+                                                                                       "initialize",
+                                                                                       "tools/list",
+                                                                                       "tools/call",
+                                                                                       "server/discover"
+                                                                                   ],
+                                                                     "protocolVersions":  [
+                                                                                              "2024-11-05",
+                                                                                              "2025-06-18"
+                                                                                          ],
+                                                                     "serverInfo":  {
+                                                                                        "name":  "swarm-desktop",
+                                                                                        "version":  "1.0.0"
+                                                                                    }
+                                                                 }
+                                                  }
+                                 }
+                  }
+              ]
+}
