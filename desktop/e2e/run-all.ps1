@@ -33,19 +33,11 @@ if ($blocking.Count -gt 0) {
     throw "Swarm.Desktop is already running ($detail). Its single-instance mutex blocks e2e; exit that instance first."
 }
 
-Write-Output '== publish-verify =='
-Push-Location $desktop
-try {
-    dotnet publish Swarm.Gateway\Swarm.Gateway.csproj -c Release -o publish-verify\Swarm.Gateway -v minimal
-    if ($LASTEXITCODE -ne 0) { throw 'gateway publish failed' }
-    dotnet publish Swarm.Desktop\Swarm.Desktop.csproj -c Release -o publish-verify\Swarm.Desktop -v minimal
-    if ($LASTEXITCODE -ne 0) { throw 'desktop publish failed' }
-}
-finally {
-    Pop-Location
-}
+Write-Output '== publish-verify (self-contained win-x64) =='
+& (Join-Path $desktop 'publish.ps1') -Configuration Release -OutputPath $verifyRoot
+if ($LASTEXITCODE -ne 0) { throw "publish failed with exit code $LASTEXITCODE" }
 
-$suites = @('p0-routing.ps1', 'p1-pixels.ps1', 'p2-overlay.ps1', 'edge-pixels.ps1', 'type-focus.ps1')
+$suites = @('p0-routing.ps1', 'p1-pixels.ps1', 'p1-s-invariants.ps1', 'p2-overlay.ps1', 'edge-pixels.ps1', 'type-focus.ps1', 'edge-tiers.ps1')
 $failed = @()
 foreach ($suite in $suites) {
     Write-Output "== $suite =="
@@ -54,7 +46,7 @@ foreach ($suite in $suites) {
 }
 # Cleanup is part of the contract: report anything the suites failed to remove.
 $profiles = @(Get-ChildItem $env:TEMP -Filter 'swarm-edge-profile-*' -Directory -ErrorAction SilentlyContinue)
-$pages = @('swarm-e2e-edge.html', 'swarm-edge-pixels.html' |
+$pages = @('swarm-e2e-edge.html', 'swarm-edge-pixels.html', 'swarm-edge-tiers.html', 'swarm-p1-s-capture.html' |
     ForEach-Object { Join-Path $env:TEMP $_ } |
     Where-Object { Test-Path -LiteralPath $_ })
 $strayEdge = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |

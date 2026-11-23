@@ -1,5 +1,12 @@
 $ErrorActionPreference = 'Stop'
 $root = (Join-Path $PSScriptRoot '..\publish-verify')
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class PixelE2eNative {
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+}
+'@
 function Say([string]$text) { Write-Output $text }
 function Assert([string]$name, [bool]$ok, $detail) {
     if (-not $ok) { Say "FAIL $name :: $detail"; throw "assertion failed: $name" }
@@ -95,6 +102,8 @@ public static class DlgClick2 {
     $token = $begin.structuredContent.token
     Assert 'task_begin token' (-not [string]::IsNullOrWhiteSpace($token)) "token length $($token.Length)"
     Assert 'capabilities messageReliable' ($begin.structuredContent.capabilities.messageReliable -eq $true) ($begin.structuredContent.capabilities | ConvertTo-Json -Compress)
+    [void][PixelE2eNative]::SetForegroundWindow($target.MainWindowHandle)
+    Start-Sleep -Milliseconds 400
     $vw = [double]$begin.structuredContent.viewport.width
     $vh = [double]$begin.structuredContent.viewport.height
     $x = [math]::Round($vw / 2, 1)

@@ -11,6 +11,7 @@ export function createOpsState(session) {
     steps: [],
     active: true,
     status: "",
+    control: "running",
     lastSeq: 0,
     seen: 0,
   };
@@ -48,6 +49,14 @@ export function applyOpsEvent(state, message) {
         error: raw.error ? String(raw.error).slice(0, 120) : "",
         tier: String(raw.tier || "none"),
         verified: Boolean(raw.verified),
+        verification: raw.verification
+          ? String(raw.verification)
+          : raw.verified
+            ? "passed"
+            : raw.evidence != null
+              ? "unverified"
+              : "not_requested",
+        evidence: raw.evidence ? String(raw.evidence) : "",
         note: raw.note ? String(raw.note).slice(0, 120) : "",
       };
       const steps = state.steps.slice();
@@ -58,6 +67,14 @@ export function applyOpsEvent(state, message) {
         ...state,
         steps: steps.length > OPS_LIMIT ? steps.slice(steps.length - OPS_LIMIT) : steps,
         seen: known || index >= 0 ? state.seen : state.seen + 1,
+        lastSeq: bumpSeq(state, message),
+      };
+    }
+    case "op-control": {
+      if (!state.active) return state;
+      return {
+        ...state,
+        control: String(message.state || "running"),
         lastSeq: bumpSeq(state, message),
       };
     }
@@ -76,6 +93,19 @@ export function applyOpsEvent(state, message) {
   }
 }
 
+export function stepStateText(step) {
+  if (step.status === "pending") return "已计划";
+  if (step.status === "running") return "已发起";
+  if (step.status === "succeeded") {
+    if (step.verification === "passed") return "已验证";
+    if (step.verification === "unverified") return "已执行 · 未验证";
+    return "已执行";
+  }
+  if (step.status === "failed") return "失败";
+  if (step.status === "canceled") return "已取消";
+  return "";
+}
+
 export function summarize(state) {
   const steps = state.steps;
   return {
@@ -88,4 +118,9 @@ export function summarize(state) {
 
 export function hiddenCount(state) {
   return Math.max(0, Number(state.seen) - state.steps.length);
+}
+
+// 只有已经结束且确实记录了步骤的会话才允许做视觉回放。
+export function replayable(state) {
+  return Boolean(state && !state.active && Array.isArray(state.steps) && state.steps.length > 0);
 }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyOpsEvent, createOpsState, hiddenCount, summarize, OPS_LIMIT } from "./ops.mjs";
+import { applyOpsEvent, createOpsState, hiddenCount, replayable, stepStateText, summarize, OPS_LIMIT } from "./ops.mjs";
 
 test("步骤按到达顺序累积并统计进度", () => {
   let state = createOpsState({ id: "s1", title: "记事本：草稿", target: "pid 42" });
@@ -64,6 +64,53 @@ test("结束后的迟到步骤不会复活会话", () => {
 
   assert.equal(state.active, false);
   assert.equal(state.steps.length, 0);
+});
+
+test("计划与独立验证结果在同一步骤上更新", () => {
+  let state = createOpsState({ id: "s1" });
+  state = applyOpsEvent(state, { type: "op-step", seq: 1, phase: "plan", step: { id: "a1", label: "点击", status: "pending" } });
+  state = applyOpsEvent(state, { type: "op-step", seq: 2, phase: "end", step: { id: "a1", label: "点击", status: "succeeded", verification: "unverified", evidence: "none" } });
+
+  assert.equal(state.steps.length, 1);
+  assert.equal(state.steps[0].status, "succeeded");
+  assert.equal(state.steps[0].verification, "unverified");
+  assert.equal(state.steps[0].evidence, "none");
+});
+
+test("旧事件按 verified 与 evidence 兼容映射验证状态", () => {
+  let state = createOpsState({ id: "s1" });
+  state = applyOpsEvent(state, { type: "op-step", step: { id: "a1", label: "点击", status: "succeeded", verified: true } });
+  state = applyOpsEvent(state, { type: "op-step", step: { id: "a2", label: "输入", status: "succeeded", verified: false } });
+
+  assert.equal(state.steps[0].verification, "passed");
+  assert.equal(state.steps[1].verification, "not_requested");
+});
+
+test("控制状态共用会话序号并丢弃乱序事件", () => {
+  let state = createOpsState({ id: "s1" });
+  state = applyOpsEvent(state, { type: "op-control", sessionId: "s1", seq: 2, state: "paused" });
+  state = applyOpsEvent(state, { type: "op-control", sessionId: "s1", seq: 1, state: "running" });
+
+  assert.equal(state.control, "paused");
+  assert.equal(state.lastSeq, 2);
+});
+
+test("时间线区分计划发起执行与独立验证状态", () => {
+  assert.equal(stepStateText({ status: "pending" }), "已计划");
+  assert.equal(stepStateText({ status: "running" }), "已发起");
+  assert.equal(stepStateText({ status: "succeeded", verification: "passed" }), "已验证");
+  assert.equal(stepStateText({ status: "succeeded", verification: "unverified" }), "已执行 · 未验证");
+  assert.equal(stepStateText({ status: "succeeded", verification: "not_requested" }), "已执行");
+});
+
+test("只有已结束且包含步骤的会话可以模拟回放", () => {
+  let state = createOpsState({ id: "s1" });
+  assert.equal(replayable(state), false);
+  state = applyOpsEvent(state, { type: "op-step", step: { id: "a1", label: "点击", status: "succeeded" } });
+  assert.equal(replayable(state), false);
+  state = applyOpsEvent(state, { type: "op-end", session: { id: "s1", status: "succeeded" } });
+  assert.equal(replayable(state), true);
+  assert.equal(replayable(null), false);
 });
 
 test("部分完成与取消状态被保留并可统计溢出数量", () => {
