@@ -36,6 +36,35 @@ public sealed class ActionCoordinator
         }
     }
 
+    /// <summary>与 <see cref="RunAsync"/> 相同，但把执行结果带回调用方；临界区语义完全一致。</summary>
+    public async Task<T> RunAsync<T>(
+        Func<CancellationToken, Task> prepare,
+        Func<CancellationToken, Task<T>> execute,
+        CancellationToken cancellationToken = default)
+    {
+        CancellationToken generationToken;
+        lock (_sync)
+        {
+            if (_stopped) throw new InvalidOperationException("动作协调器已停止");
+            if (_paused) throw new InvalidOperationException("人工接管中，动作已暂停");
+            generationToken = _generation.Token;
+        }
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, generationToken);
+        var token = linked.Token;
+        await _gate.WaitAsync(token);
+        try
+        {
+            token.ThrowIfCancellationRequested();
+            await prepare(token);
+            token.ThrowIfCancellationRequested();
+            return await execute(token);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     /// <summary>
     /// 取消当前代次的在途动作并立即建立新代次：会话保持可用，区别于 Stop。
     /// 已交给 Win32 的原子输入无法撤回，但后续步骤会停下；取消时处于暂停/停止状态则无效果。

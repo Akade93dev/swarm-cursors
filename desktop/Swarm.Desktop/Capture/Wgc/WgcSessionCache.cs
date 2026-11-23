@@ -3,11 +3,15 @@ namespace Swarm.Desktop;
 /// <summary>
 /// 按窗口复用 WGC 会话。窗口关闭或会话不可用时立即丢弃，下次调用重新建立。
 /// 只对"刚用过的会话"做失效回收，避免并发抓不同窗口时误释放别人正在用的会话。
+/// 容量受限（默认 6）：WGC 每个会话都持有 D3D 纹理与取帧线程，内存紧张时按最久未用淘汰。
 /// </summary>
 internal sealed class WgcSessionCache : IDisposable
 {
-    private readonly Dictionary<nint, WgcWindowCapture> _sessions = new();
+    private readonly Dictionary<nint, Entry> _sessions = new();
     private readonly object _gate = new();
+    private readonly int _capacity;
+
+    public WgcSessionCache(int? capacity = null) => _capacity = capacity ?? ReadCapacity();
 
     internal int Count
     {
@@ -16,11 +20,28 @@ internal sealed class WgcSessionCache : IDisposable
 
     internal WgcCaptureResult Capture(nint window, int timeoutMs)
     {
-        Prune();
-        var session = GetOrCreate(window);
-        var result = session.Capture(timeoutMs);
+        Entry entry;
+        var evicted = new List<WgcWindowCapture>();
+        lock (_gate)
+        {
+            PruneLocked(evicted);
+            if (_sessions.TryGetValue(window, out var existing))
+            {
+                existing.LastUsed = DateTimeOffset.UtcNow;
+                entry = existing;
+            }
+            else
+            {
+                entry = new Entry(new WgcWindowCapture(window));
+                _sessions[window] = entry;
+                EvictLocked(evicted);
+            }
+        }
+        foreach (var stale in evicted) stale.Dispose();
+
+        var result = entry.Session.Capture(timeoutMs);
         if (result.Code is "window_closed" or "wgc_unsupported" or "wgc_device_failed" or "wgc_item_failed")
-            Drop(window, session);
+            Drop(window, entry.Session);
         return result;
     }
 
@@ -28,26 +49,22 @@ internal sealed class WgcSessionCache : IDisposable
     /// 清理已关闭窗口的会话：抓屏入口只在目标窗口仍存活时才会走到这里，
     /// 但用户可能切换到别的窗口，旧会话的取帧线程与 D3D 资源需要及时释放。
     /// </summary>
-    private void Prune()
+    private void PruneLocked(List<WgcWindowCapture> dead)
     {
-        var dead = new List<WgcWindowCapture>();
-        lock (_gate)
+        foreach (var pair in _sessions.Where(pair => !NativeMethods.IsWindow(pair.Key)).ToArray())
         {
-            foreach (var session in _sessions.Values)
-                if (!NativeMethods.IsWindow(session.Window)) dead.Add(session);
-            foreach (var session in dead) _sessions.Remove(session.Window);
+            dead.Add(pair.Value.Session);
+            _sessions.Remove(pair.Key);
         }
-        foreach (var session in dead) session.Dispose();
     }
 
-    private WgcWindowCapture GetOrCreate(nint window)
+    private void EvictLocked(List<WgcWindowCapture> evicted)
     {
-        lock (_gate)
+        while (_sessions.Count > _capacity)
         {
-            if (_sessions.TryGetValue(window, out var existing)) return existing;
-            var created = new WgcWindowCapture(window);
-            _sessions[window] = created;
-            return created;
+            var oldest = _sessions.MinBy(pair => pair.Value.LastUsed);
+            evicted.Add(oldest.Value.Session);
+            _sessions.Remove(oldest.Key);
         }
     }
 
@@ -55,7 +72,7 @@ internal sealed class WgcSessionCache : IDisposable
     {
         lock (_gate)
         {
-            if (_sessions.TryGetValue(window, out var current) && ReferenceEquals(current, session))
+            if (_sessions.TryGetValue(window, out var current) && ReferenceEquals(current.Session, session))
                 _sessions.Remove(window);
         }
         session.Dispose();
@@ -66,9 +83,27 @@ internal sealed class WgcSessionCache : IDisposable
         WgcWindowCapture[] all;
         lock (_gate)
         {
-            all = _sessions.Values.ToArray();
+            all = _sessions.Values.Select(entry => entry.Session).ToArray();
             _sessions.Clear();
         }
         foreach (var session in all) session.Dispose();
+    }
+
+    private static int ReadCapacity()
+    {
+        var raw = Environment.GetEnvironmentVariable("SWARM_WGC_SESSIONS");
+        return int.TryParse(raw, out var value) ? Math.Clamp(value, 1, 32) : 6;
+    }
+
+    private sealed class Entry
+    {
+        public Entry(WgcWindowCapture session)
+        {
+            Session = session;
+            LastUsed = DateTimeOffset.UtcNow;
+        }
+
+        public WgcWindowCapture Session { get; }
+        public DateTimeOffset LastUsed { get; set; }
     }
 }

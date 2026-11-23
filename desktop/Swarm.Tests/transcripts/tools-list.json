@@ -819,6 +819,64 @@
                   "idempotentHint": true,
                   "openWorldHint": false
                 }
+              },
+              {
+                "name": "desktop_status",
+                "description": "Read desktop concurrency diagnostics without touching any window: active sessions, capacity, isolation mode, capture reuse, lease queues, UIA circuit state and input-tier hit counts.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {},
+                  "required": [],
+                  "additionalProperties": false
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "sessions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "capacity": {
+                      "type": "integer"
+                    },
+                    "active": {
+                      "type": "integer"
+                    },
+                    "isolation": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "capture": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "leases": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "uia": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "tiers": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "mirrorEnabled": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "annotations": {
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                }
               }
             ]
           }

@@ -6,11 +6,12 @@ using System.Windows.Interop;
 using System.Windows.Threading;
 using Microsoft.Web.WebView2.Core;
 using Swarm.Core.Diagnostics;
+using Swarm.Core.Governance;
 using Swarm.Core.Semantics;
 
 namespace Swarm.Desktop;
 
-public partial class MainWindow : Window
+public partial class MainWindow : Window, IConfirmationPresenter
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     /// <summary>后台重建总预算：超时降级为仅截图，绝不让 UIA/编码把输入卡住。</summary>
@@ -59,7 +60,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         _tasks = new DesktopTaskService(this);
         _ipcServer = new DesktopIpcServer(HandleIpc);
-        _controlServer = new DesktopControlServer(() => _tasks.CancelCurrent());
+        _controlServer = new DesktopControlServer(processId => _tasks.CancelCurrent(processId));
         _pointerPump = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(33) };
         _pointerPump.Tick += (_, _) => SamplePointer();
         SourceInitialized += OnSourceInitialized;
@@ -123,12 +124,12 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task<string> HandleIpc(string line, int processId, Func<double, string?, Task> progress)
-    {
-        var operation = Dispatcher.InvokeAsync(() => _tasks.HandleJsonAsync(line, processId, progress));
-        var request = await operation.Task;
-        return await request;
-    }
+    /// <summary>
+    /// IPC 请求直接在管道线程执行：不同 Gateway 的请求真正并行，
+    /// 只有触碰 WPF 的少数调用（覆盖层/确认框）会各自切回 UI 线程。
+    /// </summary>
+    private Task<string> HandleIpc(string line, int processId, Func<double, string?, Task> progress) =>
+        _tasks.HandleJsonAsync(line, processId, progress);
 
     private void OnSourceInitialized(object? sender, EventArgs e)
     {
@@ -397,6 +398,11 @@ public partial class MainWindow : Window
 
     public void ShowTaskOverlay(RectInt monitor, double dpi)
     {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.BeginInvoke(() => ShowTaskOverlay(monitor, dpi));
+            return;
+        }
         _overlayMode = OverlayMode.Task;
         ApplyGeometry(monitor, dpi);
         EnsureClickThrough();
@@ -404,6 +410,11 @@ public partial class MainWindow : Window
 
     public void HideTaskOverlay()
     {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.BeginInvoke(HideTaskOverlay);
+            return;
+        }
         if (_overlayMode != OverlayMode.Task) return;
         if (_active)
         {
@@ -434,16 +445,50 @@ public partial class MainWindow : Window
         HideOverlay();
     }
 
-    public bool ConfirmLocal(string title, string message, bool danger)
+    /// <summary>
+    /// 非阻塞确认：MessageBox 放到独立 STA 线程，WPF 消息泵与其它会话都不会被阻塞；
+    /// 不再使用 MB_SETFOREGROUND，弹窗不会强制夺取前台焦点，也不会叠罗汉（ConfirmationQueue 串行）。
+    /// 保留原生 #32770 对话框，是为了让既有 e2e 自动化仍能按窗口类定位并点击“是”。
+    /// </summary>
+    public Task<bool> AskAsync(string title, string message, bool danger, CancellationToken cancellationToken)
     {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         const uint yesNo = 0x4;
         const uint iconQuestion = 0x20;
         const uint iconWarning = 0x30;
-        const uint setForeground = 0x10000;
         const uint topmost = 0x40000;
         const uint defaultNo = 0x100;
-        var result = NativeMethods.MessageBox(_handle, message, title, yesNo | (danger ? iconWarning | defaultNo : iconQuestion) | setForeground | topmost);
-        return result == 6;
+        var flags = yesNo | (danger ? iconWarning | defaultNo : iconQuestion) | topmost;
+
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var result = NativeMethods.MessageBox(0, message, title, flags);
+                completion.TrySetResult(result == 6);
+            }
+            catch (Exception error)
+            {
+                completion.TrySetException(error);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "SwarmConfirmation",
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+
+        if (!cancellationToken.CanBeCanceled) return completion.Task;
+        return AwaitWithCancellationAsync(completion.Task, cancellationToken);
+    }
+
+    private static async Task<bool> AwaitWithCancellationAsync(Task<bool> task, CancellationToken cancellationToken)
+    {
+        var canceled = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = cancellationToken.Register(() => canceled.TrySetCanceled());
+        var first = await Task.WhenAny(task, canceled.Task).ConfigureAwait(false);
+        return await first.ConfigureAwait(false);
     }
 
     private void ShowRebuild(CapturedScreen capture)

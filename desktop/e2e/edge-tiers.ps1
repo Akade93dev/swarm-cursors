@@ -10,7 +10,29 @@ public static class TierForeground {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint attachTo, bool doAttach);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
     public static IntPtr Root() { return GetAncestor(GetForegroundWindow(), 2); }
+    // 前台锁会拒绝后台进程直接 SetForegroundWindow；挂到当前前台线程的输入队列后再抢，是标准绕行方式。
+    public static bool ForceForeground(IntPtr target) {
+        if (Root() == target) return true;
+        var foreground = GetForegroundWindow();
+        var foregroundThread = GetWindowThreadProcessId(foreground, IntPtr.Zero);
+        var currentThread = GetCurrentThreadId();
+        var attached = foregroundThread != 0 && foregroundThread != currentThread
+            && AttachThreadInput(currentThread, foregroundThread, true);
+        try {
+            ShowWindow(target, 9);
+            BringWindowToTop(target);
+            SetForegroundWindow(target);
+            return Root() == target;
+        } finally {
+            if (attached) AttachThreadInput(currentThread, foregroundThread, false);
+        }
+    }
 }
 '@
 function Say([string]$text) { Write-Output $text }
@@ -138,9 +160,13 @@ public static class TierDlgClick {
     }
     if ($foregroundHarness.MainWindowHandle -eq 0) { throw 'external foreground harness not found' }
     $foregroundHandle = $foregroundHarness.MainWindowHandle
-    [void][TierForeground]::SetForegroundWindow($foregroundHandle)
-    Start-Sleep -Milliseconds 300
-    if ([TierForeground]::Root() -ne $foregroundHandle) { throw 'could not foreground external harness' }
+    # Windows 前台锁会让后台进程的 SetForegroundWindow 偶发被拒；用 AttachThreadInput 抢前台并重试。
+    $foregrounded = $false
+    for ($i = 0; $i -lt 5; $i++) {
+        if ([TierForeground]::ForceForeground($foregroundHandle)) { $foregrounded = $true; break }
+        Start-Sleep -Milliseconds 200
+    }
+    if (-not $foregrounded) { throw 'could not foreground external harness' }
     Say "EXTERNAL FOREGROUND hwnd=$foregroundHandle"
 
     # 观察载荷的元素字段：id / type(控件类型) / name / value / bounds / patterns。
@@ -169,6 +195,34 @@ public static class TierDlgClick {
         if (-not $rootUnchanged) { throw "$kind changed external foreground root: before=$before after=$after expected=$foregroundHandle" }
     }
 
+    # type 放在最前面：后面 click-select 会触发页面重渲染，让输入框的 UIA 元素失效。
+    # Chromium 的输入框在后台窗口下没有可用的 ValuePattern，协议要求先 focus；这里如实记录该结果，
+    # 而不是静默当作失败（否则 ratios 会随页面渲染时序漂移）。
+    $input = FindEl 'tier-input'
+    if ($input) {
+        $result = Tool 'type_text' @{ token = $token; elementId = $input.id; text = 'swarm' }
+        $payload = $result.structuredContent
+        if ($null -eq $payload) { $payload = $result }
+        $tier = [string]$payload.tier
+        $code = if ($payload.error) { [string]$payload.error.code } else { '' }
+        if ($tier) {
+            $tiers['type-input'] = $tier
+            $foreground += [bool]$payload.foregroundUnchanged
+            $externalForeground += $true
+            Say "TYPE-INPUT tier=$tier verified=$($payload.verified)"
+        }
+        elseif ($code -eq 'needs_foreground') {
+            $tiers['type-input'] = 'foreground'
+            $foreground += $true
+            $externalForeground += $true
+            Say 'TYPE-INPUT defer=needs_foreground (chromium input requires foreground)'
+        }
+        else {
+            throw "type-input failed: code=$code message=$($payload.error.message)"
+        }
+    }
+    else { Say 'MISS type-input' }
+
     $btn = FindEl 'tier-button'
     if ($btn) { Record 'click-button' { Tool 'click' @{ token = $token; elementId = $btn.id } } }
     else { Say 'MISS click-button' }
@@ -184,10 +238,6 @@ public static class TierDlgClick {
     $select = FindEl 'tier-select'
     if ($select) { Record 'click-select' { Tool 'click' @{ token = $token; elementId = $select.id } } }
     else { Say 'MISS click-select' }
-
-    $input = FindEl 'tier-input'
-    if ($input) { Record 'type-input' { Tool 'type_text' @{ token = $token; elementId = $input.id; text = 'swarm' } } }
-    else { Say 'MISS type-input' }
 
     # 页面本身可滚动时，Chromium 在 Document 上暴露带 ScrollPattern 的滚动容器。
     $scroller = $elements | Where-Object { $_.type -eq 'Document' } | Select-Object -First 1

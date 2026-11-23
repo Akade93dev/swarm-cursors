@@ -37,7 +37,10 @@ Write-Output '== publish-verify (self-contained win-x64) =='
 & (Join-Path $desktop 'publish.ps1') -Configuration Release -OutputPath $verifyRoot
 if ($LASTEXITCODE -ne 0) { throw "publish failed with exit code $LASTEXITCODE" }
 
-$suites = @('p0-routing.ps1', 'p1-pixels.ps1', 'p1-s-invariants.ps1', 'p2-overlay.ps1', 'edge-pixels.ps1', 'type-focus.ps1', 'edge-tiers.ps1')
+$suites = @('p0-routing.ps1', 'p1-pixels.ps1', 'p1-s-invariants.ps1', 'p2-overlay.ps1', 'edge-pixels.ps1', 'type-focus.ps1', 'edge-tiers.ps1', 'concurrency.ps1')
+# Tier C 的空闲门限生产默认 2s；e2e 里按秒等待会与机器上其他输入相互干扰，
+# 统一收紧到 400ms（仍大于“注入后立刻判定”的时间，defer 语义不变）。
+$env:SWARM_TIER_C_IDLE_MS = '400'
 $failed = @()
 foreach ($suite in $suites) {
     Write-Output "== $suite =="
@@ -46,7 +49,7 @@ foreach ($suite in $suites) {
 }
 # Cleanup is part of the contract: report anything the suites failed to remove.
 $profiles = @(Get-ChildItem $env:TEMP -Filter 'swarm-edge-profile-*' -Directory -ErrorAction SilentlyContinue)
-$pages = @('swarm-e2e-edge.html', 'swarm-edge-pixels.html', 'swarm-edge-tiers.html', 'swarm-p1-s-capture.html' |
+$pages = @('swarm-e2e-edge.html', 'swarm-edge-pixels.html', 'swarm-edge-tiers.html', 'swarm-p1-s-capture.html', 'swarm-concurrency-a.html', 'swarm-concurrency-b.html', 'swarm-concurrency-c.html' |
     ForEach-Object { Join-Path $env:TEMP $_ } |
     Where-Object { Test-Path -LiteralPath $_ })
 $strayEdge = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |

@@ -9,6 +9,7 @@ public sealed class McpGateway
     private static readonly HashSet<string> ToolNames = new(StringComparer.Ordinal)
     {
         "task_begin", "observe", "click", "type_text", "press_key", "scroll", "focus", "task_end", "task_stop",
+        "desktop_status",
     };
 
     private readonly IDesktopGatewayTransport _transport;
@@ -514,6 +515,25 @@ public sealed class McpGateway
         Tool("focus", "Explicitly bring the authorized target window to the foreground. Only needed when an action returns needs_foreground.", new { token = StringSchema("Task token."), observe = BooleanSchema("Return a fresh observation after focusing."), confirmToken = StringSchema("One-time token returned by needs_confirmation for this exact action.") }, new[] { "token" }, new ToolAnnotations(ReadOnly: false, Destructive: false, Idempotent: true, OpenWorld: true), ActionOutputSchema()),
         Tool("task_end", "End the authorized desktop task normally.", new { token = StringSchema("Task token.") }, new[] { "token" }, new ToolAnnotations(ReadOnly: false, Destructive: false, Idempotent: true, OpenWorld: false), EndOutputSchema()),
         Tool("task_stop", "Stop the authorized desktop task immediately. The local user can press Esc for emergency stop.", new { token = StringSchema("Task token.") }, new[] { "token" }, new ToolAnnotations(ReadOnly: false, Destructive: false, Idempotent: true, OpenWorld: false), EndOutputSchema()),
+        Tool("desktop_status", "Read desktop concurrency diagnostics without touching any window: active sessions, capacity, isolation mode, capture reuse, lease queues, UIA circuit state and input-tier hit counts.", new { }, Array.Empty<string>(), new ToolAnnotations(ReadOnly: true, Destructive: false, Idempotent: true, OpenWorld: false), StatusOutputSchema()),
+    };
+
+    private static object StatusOutputSchema() => new
+    {
+        type = "object",
+        properties = new Dictionary<string, object?>
+        {
+            ["sessions"] = new { type = "array", items = OpenObjectSchema() },
+            ["capacity"] = new { type = "integer" },
+            ["active"] = new { type = "integer" },
+            ["isolation"] = OpenObjectSchema(),
+            ["capture"] = OpenObjectSchema(),
+            ["leases"] = OpenObjectSchema(),
+            ["uia"] = OpenObjectSchema(),
+            ["tiers"] = OpenObjectSchema(),
+            ["mirrorEnabled"] = new { type = "boolean" },
+        },
+        additionalProperties = true,
     };
 
     private readonly record struct ToolAnnotations(bool ReadOnly, bool Destructive, bool Idempotent, bool OpenWorld);

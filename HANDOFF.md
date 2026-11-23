@@ -42,7 +42,7 @@ desktop/
 │   │   └── OperationStep.cs               # InputTier 枚举: None/Uia/Message/Input
 │   ├── WordBridge/
 │   │   └── FileBasedWordBridge.cs         # 🆕 DocumentFormat.OpenXml 3.1.0 纯托管
-│   ├── ActionCoordinator.cs               # 🔴 全局 SemaphoreSlim(1,1) —— 当前瓶颈
+│   ├── ActionCoordinator.cs               # per-session 门 + 泛型 RunAsync；跨会话不再共享锁
 │   ├── Ipc/
 │   │   └── GatewayIpcProtocol.cs          # 网关 ↔ Desktop 协议 (ok/result/error)
 │   └── Input/
@@ -90,8 +90,7 @@ desktop/
 
 ```
 Swarm.Desktop:
-  TesseractOCR 5.5.1            # OCR, 内嵌 Native DLL
-  Microsoft.ML.OnnxRuntime 1.21.0  # ⚠️ 已装未用 (约 13MB), 可考虑卸掉
+  TesseractOCR 5.5.1            # OCR, 内嵌 Native DLL (唯一 OCR 引擎)
   Vortice.Direct3D11 3.8.3      # 截图/镜像通道
   Microsoft.Web.WebView2 1.0.4314.35  # Desktop UI 壳
 
@@ -209,7 +208,7 @@ desktop/debug-*.mjs, v-test.mjs, quick-test.mjs
 
 ---
 
-## 五、当前串行瓶颈（P0 必须修）
+## 五、串行瓶颈分析（P0 已修复, 保留作对照）
 
 ### 5.1 全局锁问题
 
@@ -256,7 +255,7 @@ await coordinator.RunAsync(
 
 ---
 
-## 六、SERPENT 并发最优解（已设计, 待实现）
+## 六、SERPENT 并发最优解（已落地, P0–P6）
 
 ### 核心改动: ActionCoordinator → WindowScopeLock
 
@@ -325,6 +324,30 @@ await coordinator.RunAsync(
 | Cua Multi-Player 容器隔离 | [cua.ai blog](https://cua.ai/blog/clawcon-multiplayer) | 工业落地 |
 | MACU DAG 并行调度 | [arXiv:2606.01533](https://arxiv.org/pdf/2606.01533v1) | 论文 |
 | MouseMux 驱动级多光标 | [mousemux.com](https://www.mousemux.com/pages/manual/) | 商用备选 |
+
+### 落地状态 (P0–P6 已完成)
+
+上面的组件名是设计期的叫法, 实际落地时按职责重新命名 (语义不变, 均是纯新增/内部重写, MCP 工具名与参数未变):
+
+| 设计期 | 实际落地 |
+|---|---|
+| `WindowScopeLock` | `Swarm.Core/Concurrency/LeaseManager.cs` (FIFO 公平锁: `AcquireWindowAsync` / `AcquireDisplayAsync`) + 两把叶子锁 `WindowLease` → `DisplayLease` |
+| `TaskDispatcher` | `DesktopTaskService` 只保留服务级单例 (SessionRegistry / LeaseManager / ConfirmationQueue / UiaWatchdog); 会话状态下沉到 `Swarm.Desktop/DesktopSession.cs` 的 `TaskSession`, `ActionCoordinator` 改为 per-session |
+| `ObserveDeduplicator` | `CaptureService` per-(hwnd,generation) `SingleFlight` + 300ms 复用缓存; 写动作 `WriteGeneration++` 失效 |
+| `InputRouter` | `InputDispatcher` 内 Tier A/B/C 分发 + `InputTier` 计数, 写动作前 `CaptureService.Invalidate` |
+
+新增的配套件:
+
+- `Swarm.Desktop/Unobtrusive.cs`: `UserPresenceGuard` (`GetLastInputInfo` + 自身注入归因 + 显式恢复基线), `CursorRestore` (用户没动输入才把光标放回)
+- `Swarm.Desktop/UiaWatchdog.cs`: UIA 读 3.5s 超时、连续 2 次失败隔离 30s; `IsolationProbe` 探测 RDP/沙箱能力 (本机 Home 版 → `soft`)
+- `Swarm.Core/Governance/ConfirmationQueue.cs`: 确认弹窗串行, `MainWindow` 实现 `IConfirmationPresenter` (独立 STA 线程 + 原生 MessageBox, 无 `SETFOREGROUND`, 不阻塞 UI)
+- `DesktopIpcServer` 并发 accept (16 连接); `DesktopControlServer` 按调用方 PID 精确取消
+- OCR 门改为串行 (`_ocrGate = SemaphoreSlim(1,1)`): Tesseract `Engine` 是单图状态机, 并发 observe 会抛 `Only one image can be processed at once`; 串行仍在后台线程, 不占窗口/显示租约
+- 只读诊断工具 `desktop_status` (MCP): active/capacity/isolation/capture/leases/uia/tiers
+
+硬约束的落地方式: Tier C 前必须 `EnsureUserIdleForTierC()` (默认 2s 无真实输入, `SWARM_TIER_C_IDLE_MS` 可调), 一次 `SendInput` 合并移动+按键, 全局 `SendSync` 串行, 任何真实输入立即 `manual_takeover`。
+
+验收基线: `dotnet build -c Release -warnaserror` 0 警告 0 错误; `dotnet test -c Release` 379 通过; `desktop/e2e/run-all.ps1` 8 个套件全 PASS (新增 `concurrency.ps1`: 3 Gateway 真并发 + `desktop_status.active=3` + 跨会话 token 拒绝 + 第 4 会话 `capacity_exceeded` + 确认框不抢焦点)。
 
 ---
 
@@ -420,13 +443,13 @@ public sealed record SoMElement(
 
 | 债 | 说明 | 处理 |
 |---|---|---|
-| `Microsoft.ML.OnnxRuntime 1.21.0` | 已装未用, ~13MB | 可以卸掉, 减小发布包 |
-| `OverlapsAnyUia` 函数名 | 有误导性 (实际只检查 UIA, 不检查 OCR 内部) | 建议改名 `OverlapsUiaCandidates` |
-| `ActionCoordinator.RunAsync` 全局锁 | Tier A/B 被串行化 | **P0 必修** → WindowScopeLock 三级锁 |
-| Desktop TaskDispatcher 缺失 | 当前 IPC handler 硬编码包全局锁 | **P2 修** → 引入路由 |
-| Pipeline / CI | 无 GitHub Actions | 后续加: build + test + publish |
-| E2E 测试 | 只有单元测试 | 加: 真实 Desktop + Gateway + Node harness |
-| tessdata 硬编码路径 | `desktop/tessdata/` 相对路径 | 改用 `AppContext.BaseDirectory` 拼接 |
+| `Microsoft.ML.OnnxRuntime 1.21.0` | 死依赖 (Tesseract 不依赖; nuspec/程序集/原生库三处已核实) | ✅ 已卸: publish 176.0 → 162.9 MB, 少 13.1 MB |
+| `OverlapsAnyUia` 函数名 | 有误导性 (实际只检查 UIA, 不检查 OCR 内部) | 待办: 改名 `OverlapsUiaCandidates` |
+| `ActionCoordinator.RunAsync` 全局锁 | Tier A/B 被串行化 | ✅ 已修: `LeaseManager` (WindowLease → DisplayLease) + per-session 门 |
+| Desktop TaskDispatcher 缺失 | 当前 IPC handler 硬编码包全局锁 | ✅ 已落地: `TaskSession` + `DesktopTaskService` 只留无状态共享设施 |
+| Pipeline / CI | 无 GitHub Actions | ✅ 已加: `.github/workflows/desktop-release.yml` |
+| E2E 测试 | 只有单元测试 | ✅ 已有 8 个套件 (含 3-Gateway 并发), 仍缺 Node harness |
+| tessdata 硬编码路径 | `desktop/tessdata/` 相对路径 | ✅ 已改为 `AppContext.BaseDirectory` + `SWARM_TESSDATA_DIR` 覆盖 |
 
 ---
 
@@ -486,22 +509,38 @@ Commit `8a6f1ce` 本地已创建, 网络恢复后 `git push origin chore/net10` 
 
 ## 十三、下一步（按优先级）
 
-### P0 — 必须做
+### 已完成（本次交付）
 
-1. **WindowScopeLock 三级锁替换全局锁** — 释放 Tier A 100% 并行
-2. **InputRouter 路由决策引擎** — 判断每条请求能走 Tier A/B 还是必须 C
-3. **更新所有 RunAction 调用点** — DesktopTaskService.cs:938 起
+1. ~~三级锁替换全局锁~~ → `LeaseManager` (WindowLease → DisplayLease, FIFO 公平锁)，Tier A/B 跨窗口真并行
+2. ~~InputRouter 路由决策~~ → `InputDispatcher` Tier A/B/C 分发，写动作按窗口串行
+3. ~~只读观察并行/去重~~ → `CaptureService` 按 (hwnd, generation) single-flight + 300ms 复用
+4. ~~会话隔离~~ → 会话键为 `gatewayProcessId`，服务级状态下沉到 `TaskSession`，容量默认 3 (`SWARM_MAX_SESSIONS`)
+5. ~~CI/CD~~ → `.github/workflows/desktop-release.yml` (build `-warnaserror` + test + publish)
+6. ~~3 Gateway 并发 E2E~~ → `desktop/e2e/concurrency.ps1`，已接入 `run-all.ps1`
+7. ~~`Microsoft.ML.OnnxRuntime` 瘦身~~ → 已核实为死依赖并移除（Tesseract 不依赖；publish 176.0 → 162.9 MB）
 
-### P1 — 推荐做
+### 复核修复（本轮全量审查发现）
 
-4. **ObserveDeduplicator** — 跨窗口 observe 并行 + 同窗口 1.5s TTL 去重
-5. **`Microsoft.ML.OnnxRuntime` 卸掉** — 减小发布包
+- **光标归位失效（功能缺陷）**：`SendInput` 会刷新 `GetLastInputInfo`（已用探针实测），`CursorRestore.RestoreIfIdle` 因此永远判定"用户在场"、从不还原。改为同时接受"最近输入就是自身注入"（`LastSyntheticTick`，250ms 归因窗）。
+- **OCR 并发崩溃**：Tesseract `Engine` 是单图状态机，`_ocrGate(2)` 让并行 observe 抛 `Only one image can be processed at once`、OCR 静默退化为 0。门限改为 1。
+- **租约 FIFO 被插队**：`Release` 置 `_held=false` 与 `Pump` 之间存在空隙，新来的 Acquire 可越过排队者直接拿走；改为仅当"无持有且无排队"才快速获取。
+- **`task_end` 固定多等 1.2s**：覆盖层延时隐藏被 `await` 在响应链上；改为脱离调用链（`HideOverlayLaterAsync`）。
+- **抓屏缓存泄漏**：已关闭窗口的整帧 RGBA 被字典强引用；`TryReuse` 过期即删，写入时顺手清理失效窗口。
+- **UIA 卡死线程累积**：每次熔断解禁后仍会再卡一次并泄漏一个线程池线程；熔断改为指数退避（30s→…→8min），成功即复位。
+- **e2e 前台锁抖动**：`edge-tiers.ps1` 的 `SetForegroundWindow` 偶发被系统拒绝，改为重试 10 次再判定。
 
-### P2 — 可选
+### 遗留项清偿（本轮）
 
-6. **PiP Session 隔离 (RDP loopback)** — 用户/Agent 完全零干扰, 依赖 UFO² 论文方案
-7. **CI/CD GitHub Actions** — build + test + publish
-8. **E2E harness** — Node 脚本驱动 real Desktop + real Gateway + real 3-agent 并发
+- **`LeaseManager` 句柄表累积**：改为 `WindowGate{Lock, Refs}` 引用计数，只在 `Refs==0` 时回收空闲闸门（阈值 32），避免同一 hwnd 出现两把锁。
+- **`UiaWatchdog` PID 表累积**：超过 64 个进程时清掉“无失败、无熔断”的冷记录；`timeouts` 与 `errors`（COM/权限失败）分开统计。
+- **`IsolationProbe` 文案**：`GC.GetGCMemoryInfo().TotalAvailableMemoryBytes` 是“可用内存”而非物理内存，已改正。
+- **`MarkResumed` 时序缺陷（真实 bug）**：原实现取“恢复瞬间的最后一笔输入”作为忽略上界，但 `GetLastInputInfo` 的可见性滞后，紧接恢复的注入按键会被算作新输入，导致恢复后的第一个 Tier C 被误判 `user_active`。改为以恢复时刻为界（`TickCount`），并在 `run-all.ps1` 把测试环境的门限收紧到 400ms 以消除按秒等待的抖动。
+- **`edge-tiers.ps1` 类型输入顺序**：`click-select` 会触发页面重渲染让输入框 UIA 元素失效；把 type 放到最前，并把 `needs_foreground`（Chromium 后台无 ValuePattern）如实记录为非 A/B 动作，不再静默丢 `tier`。
+
+### 仍未做（有前置依赖，不阻塞当前版本）
+
+8. **PiP Session 隔离 (RDP loopback)** — 本机 Home 版无 RDP/Sandbox/Hyper-V，`IsolationProbe` 只能返回 `soft`；换到 Pro/Enterprise 或独立 VM 后再做
+9. **驱动级多光标 (MouseMux 这类虚拟 HID)** — 属于另一条产品路线，不是本架构的增量
 
 ### 不要做（硬约束）
 
@@ -510,6 +549,8 @@ Commit `8a6f1ce` 本地已创建, 网络恢复后 `git push origin chore/net10` 
 - **不要改 `SoMElement` 里任何默认值** — 保持向后兼容
 - **不要在 Tier A/B 的无锁区域临时加全局锁** — 这正是要移除的东西
 - **不要推翻三层输入策略** — 内部实现完全正确, 问题只在上层调度
+- **不要在 Tier C 之前跳过 `EnsureUserIdleForTierC()`** — 这是"用户无感"的唯一兜底
+- **不要把会话状态写回 `DesktopTaskService` 的单例字段** — 那会让并发能力退化回单会话
 
 ---
 

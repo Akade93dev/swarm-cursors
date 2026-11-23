@@ -14,6 +14,8 @@ public sealed class DesktopIpcServer
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromMinutes(1);
     // 正常请求是几百字节的 JSON；设置上限可避免本机异常/恶意客户端用超长单行耗尽内存。
     private const int MaxRequestChars = 1 << 20;
+    // 并发会话数上限（与 SessionRegistry 默认 3 对齐，留出 observe/status 的余量）。
+    private const int MaxConnections = 16;
     private readonly Func<string, int, Func<double, string?, Task>, Task<string>> _handler;
     private readonly CancellationTokenSource _stop = new();
     private Task? _loop;
@@ -33,19 +35,76 @@ public sealed class DesktopIpcServer
         }
     }
 
+    /// <summary>
+    /// 并发 accept：连接一旦建立就交给独立任务处理，accept 循环立刻回去等下一连接。
+    /// 原先每个连接串行处理整条请求，长 observe 会让第二个 Gateway 连不进来；
+    /// 现在不同会话的请求真正并行，同一会话由 SessionRegistry 的请求闸门串行。
+    /// </summary>
     private async Task RunAsync()
     {
+        var connections = new Dictionary<Task, byte>();
         while (!_stop.IsCancellationRequested)
+        {
+            NamedPipeServerStream pipe;
+            try
+            {
+                pipe = new NamedPipeServerStream(
+                    "SwarmDesktop.V1",
+                    PipeDirection.InOut,
+                    MaxConnections,
+                    PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                FileLog.Write("desktop", $"ipc listen failed: {error.Message}");
+                try { await Task.Delay(200, _stop.Token); } catch (OperationCanceledException) { break; }
+                continue;
+            }
+
+            try
+            {
+                await pipe.WaitForConnectionAsync(_stop.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+            {
+                await pipe.DisposeAsync();
+                break;
+            }
+            catch (Exception error) when (error is IOException or ObjectDisposedException)
+            {
+                FileLog.Write("desktop", $"ipc accept dropped: {error.Message}");
+                await pipe.DisposeAsync();
+                continue;
+            }
+
+            var task = HandleConnectionAsync(pipe);
+            lock (connections) connections[task] = 0;
+            _ = task.ContinueWith(
+                completed =>
+                {
+                    lock (connections) connections.Remove(completed);
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+
+        Task[] pending;
+        lock (connections) pending = connections.Keys.ToArray();
+        if (pending.Length > 0)
+        {
+            try { await Task.WhenAll(pending).WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch (Exception) { /* 关闭阶段在途连接不阻塞退出 */ }
+        }
+    }
+
+    private async Task HandleConnectionAsync(NamedPipeServerStream pipe)
+    {
+        await using (pipe.ConfigureAwait(false))
         {
             try
             {
-                await using var pipe = new NamedPipeServerStream(
-                    "SwarmDesktop.V1",
-                    PipeDirection.InOut,
-                    1,
-                    PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
-                await pipe.WaitForConnectionAsync(_stop.Token);
                 GetNamedPipeClientProcessId(pipe.SafePipeHandle.DangerousGetHandle(), out var processId);
                 using var reader = new StreamReader(pipe, Encoding.UTF8, false, 16 * 1024, true);
                 var writer = new StreamWriter(pipe, new UTF8Encoding(false), 16 * 1024, true) { AutoFlush = true, NewLine = "\n" };
@@ -58,7 +117,7 @@ public sealed class DesktopIpcServer
                         read.CancelAfter(RequestTimeout);
                         line = await ReadLineAsync(reader, read.Token);
                     }
-                    if (line == null) continue;
+                    if (line == null) return;
                     string response;
                     try
                     {
@@ -75,20 +134,14 @@ public sealed class DesktopIpcServer
                     await writer.FlushAsync(_stop.Token);
                 }
             }
-            catch (OperationCanceledException) when (_stop.IsCancellationRequested)
-            {
-                break;
-            }
             catch (Exception error) when (error is IOException or ObjectDisposedException or OperationCanceledException or UnauthorizedAccessException or Win32Exception or InvalidDataException)
             {
-                // 对端超时/断连/超长请求/其他用户进程：丢弃本次连接，继续接受后续请求，避免整个 IPC 静默死亡。
+                // 对端超时/断连/超长请求/其他用户进程：只丢弃本次连接，不影响其它会话。
                 FileLog.Write("desktop", $"ipc connection dropped: {error.Message}");
             }
             catch (Exception error)
             {
-                // 未预期异常同样不能终止接受循环；短暂退避避免错误持续时忙转。
-                FileLog.Write("desktop", $"ipc loop error: {error.Message}");
-                try { await Task.Delay(200, _stop.Token); } catch (OperationCanceledException) { break; }
+                FileLog.Write("desktop", $"ipc connection error: {error.Message}");
             }
         }
     }

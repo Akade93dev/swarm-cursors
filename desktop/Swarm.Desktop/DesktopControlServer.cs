@@ -8,17 +8,18 @@ using Swarm.Core.Diagnostics;
 namespace Swarm.Desktop;
 
 /// <summary>
-/// 独立取消通道。主 IPC 是"一请求一管道 + 串行 accept"，动作执行期间无法再接受连接，
-/// 所以取消必须走单独的管道。这里只接受 cancel 一种动作，并校验调用方确实是 Gateway。
+/// 独立取消通道。主 IPC 现在并发 accept，但动作执行期间仍可能占满会话的请求闸门，
+/// 所以取消继续走单独管道。这里只接受 cancel 一种动作，并校验调用方确实是 Gateway；
+/// 取消按调用方 PID 精确到会话，不会误杀其它 agent 的任务。
 /// </summary>
 public sealed class DesktopControlServer
 {
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(5);
-    private readonly Action _cancel;
+    private readonly Action<int> _cancel;
     private readonly CancellationTokenSource _stop = new();
     private Task? _loop;
 
-    public DesktopControlServer(Action cancel) => _cancel = cancel;
+    public DesktopControlServer(Action<int> cancel) => _cancel = cancel;
 
     public void Start() => _loop = Task.Run(RunAsync);
 
@@ -68,7 +69,7 @@ public sealed class DesktopControlServer
                 }
                 else
                 {
-                    _cancel();
+                    _cancel((int)processId);
                     FileLog.Write("desktop", "control cancel accepted");
                     reply = "{\"ok\":true}";
                 }

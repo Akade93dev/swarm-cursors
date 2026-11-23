@@ -1,0 +1,54 @@
+name: desktop-release
+
+on:
+  push:
+    branches: [chore/net10, main]
+    paths:
+      - 'desktop/**'
+      - '.github/workflows/desktop-release.yml'
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - '.github/workflows/desktop-release.yml'
+  workflow_dispatch:
+
+jobs:
+  build-test-publish:
+    # WPF + Win32 输入/抓屏只能在真实 Windows 桌面上构建与测试。
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore SwarmDesktop.sln
+
+      # 设计基线：Release 且 0 警告，任何警告都视为失败。
+      - name: Build (Release, warnings as errors)
+        run: dotnet build SwarmDesktop.sln -c Release --no-restore -warnaserror
+
+      # --no-build 确保测的就是上一步 Release 产物，而不是残留的 Debug 输出。
+      - name: Test (Release)
+        run: dotnet test SwarmDesktop.sln -c Release --no-build --logger "trx;LogFileName=swarm-tests.trx"
+
+      - name: Publish (self-contained win-x64)
+        run: ./publish.ps1 -Configuration Release -OutputPath "$env:RUNNER_TEMP/swarm-publish"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: swarm-desktop-win-x64
+          path: ${{ runner.temp }}/swarm-publish
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: swarm-test-results
+          path: desktop/Swarm.Tests/TestResults/*.trx
+          if-no-files-found: ignore

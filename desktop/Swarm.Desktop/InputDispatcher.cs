@@ -36,6 +36,16 @@ public static class InputDispatcher
     private const int GwlStyle = -16;
     private const int EsPassword = 0x0020;
     private const uint MkLButton = 0x0001;
+    private const uint MouseEventMove = 0x0001;
+    private const uint MouseEventLeftDown = 0x0002;
+    private const uint MouseEventLeftUp = 0x0004;
+    private const uint MouseEventWheel = 0x0800;
+    private const uint MouseEventVirtualDesk = 0x4000;
+    private const uint MouseEventAbsolute = 0x8000;
+    private const int SmXVirtualScreen = 76;
+    private const int SmYVirtualScreen = 77;
+    private const int SmCxVirtualScreen = 78;
+    private const int SmCyVirtualScreen = 79;
     private const uint CwpSkipInvisible = 0x0001;
     private const uint CwpSkipDisabled = 0x0002;
     private const uint CwpSkipTransparent = 0x0004;
@@ -51,7 +61,8 @@ public static class InputDispatcher
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (elementId != null && snapshot != null && snapshot.NativeElements.TryGetValue(elementId, out var element))
+        if (elementId != null && snapshot != null && !UiaWatchdog.IsWindowQuarantined(window) &&
+            snapshot.NativeElements.TryGetValue(elementId, out var element))
         {
             var foregroundBefore = NativeMethods.GetForegroundWindow();
             try
@@ -107,13 +118,18 @@ public static class InputDispatcher
 
         if (!allowForegroundInput)
             throw new DesktopOperationException("needs_foreground", "目标不在前台，已拒绝真实输入");
+        EnsureUserIdleForTierC();
 
         cancellationToken.ThrowIfCancellationRequested();
         if (!IsForeground(window))
             throw new DesktopOperationException("needs_foreground", "前台窗口在动作前发生变化，已取消");
-        NativeMethods.SetCursorPos(screenX, screenY);
-        cancellationToken.ThrowIfCancellationRequested();
-        Send(new[] { MouseInput(0x0002), MouseInput(0x0004) });
+        // 整组手势必须一次 SendInput：绝对移动与按下/抬起若分两次调用，其它会话可插在中间。
+        Send(new[]
+        {
+            AbsoluteMouseMove(screenX, screenY),
+            MouseInput(MouseEventLeftDown),
+            MouseInput(MouseEventLeftUp),
+        });
         return new ActionOutcome(InputTier.Input, false, "使用真实鼠标输入");
     }
 
@@ -129,7 +145,8 @@ public static class InputDispatcher
     {
         cancellationToken.ThrowIfCancellationRequested();
         AutomationElement? targetElement = null;
-        if (elementId != null && snapshot != null && snapshot.NativeElements.TryGetValue(elementId, out var element))
+        if (elementId != null && snapshot != null && !UiaWatchdog.IsWindowQuarantined(window) &&
+            snapshot.NativeElements.TryGetValue(elementId, out var element))
         {
             targetElement = element;
             var foregroundBefore = NativeMethods.GetForegroundWindow();
@@ -165,6 +182,7 @@ public static class InputDispatcher
 
         if (!allowForegroundInput)
             throw new DesktopOperationException("needs_foreground", "目标不在前台，已拒绝真实输入");
+        EnsureUserIdleForTierC();
 
         cancellationToken.ThrowIfCancellationRequested();
         if (!IsForeground(window))
@@ -181,9 +199,8 @@ public static class InputDispatcher
                 // 元素不支持编程聚焦时维持原有行为：输入到当前焦点控件。
             }
         }
-        NativeMethods.SetCursorPos(screenX, screenY);
         cancellationToken.ThrowIfCancellationRequested();
-        SendText(text);
+        SendText(text, screenX, screenY);
         return new ActionOutcome(InputTier.Input, false, "使用真实键盘输入");
     }
 
@@ -215,6 +232,7 @@ public static class InputDispatcher
 
         if (!allowForegroundInput)
             throw new DesktopOperationException("needs_foreground", "目标不在前台，已拒绝真实输入");
+        EnsureUserIdleForTierC();
         cancellationToken.ThrowIfCancellationRequested();
         if (!IsForeground(window))
             throw new DesktopOperationException("needs_foreground", "前台窗口在动作前发生变化，已取消");
@@ -250,12 +268,15 @@ public static class InputDispatcher
 
         if (!allowForegroundInput)
             throw new DesktopOperationException("needs_foreground", "目标不在前台，已拒绝真实输入");
+        EnsureUserIdleForTierC();
         cancellationToken.ThrowIfCancellationRequested();
         if (!IsForeground(window))
             throw new DesktopOperationException("needs_foreground", "前台窗口在动作前发生变化，已取消");
-        NativeMethods.SetCursorPos(screenX, screenY);
-        cancellationToken.ThrowIfCancellationRequested();
-        Send(new[] { MouseInput(0x0800, delta) });
+        Send(new[]
+        {
+            AbsoluteMouseMove(screenX, screenY),
+            MouseInput(MouseEventWheel, delta),
+        });
         return new ActionOutcome(InputTier.Input, false, "使用真实滚轮输入");
     }
 
@@ -327,6 +348,16 @@ public static class InputDispatcher
         var foreground = NativeMethods.GetForegroundWindow();
         if (foreground == 0) return false;
         return NativeMethods.GetAncestor(foreground, GaRoot) == NativeMethods.GetAncestor(window, GaRoot);
+    }
+
+    /// <summary>
+    /// Tier C 只在用户空闲时执行：真实输入会占用唯一的光标与键盘焦点，
+    /// 用户正在操作时必须主动让行，而不是和用户抢。
+    /// </summary>
+    private static void EnsureUserIdleForTierC()
+    {
+        if (UserPresenceGuard.IsIdle()) return;
+        throw new DesktopOperationException("user_active", "用户正在操作，真实输入已让行，请稍后重试", "defer");
     }
 
     private static bool TryNativeClick(AutomationElement element)
@@ -572,9 +603,9 @@ public static class InputDispatcher
             : buffer.ToString();
     }
 
-    private static void SendText(string text)
+    private static void SendText(string text, int screenX, int screenY)
     {
-        var inputs = new List<Input>(text.Length * 2);
+        var inputs = new List<Input>(text.Length * 2 + 1) { AbsoluteMouseMove(screenX, screenY) };
         foreach (var character in text)
         {
             if (character is '\r' or '\n')
@@ -678,19 +709,55 @@ public static class InputDispatcher
         Union = new InputUnion { Mouse = new MouseInputData { X = 0, Y = 0, MouseData = data, Flags = flags, Time = 0, ExtraInfo = NativeMethods.SwarmInputMarker } },
     };
 
+    /// <summary>
+    /// 绝对定位的鼠标移动事件。与按下/抬起放进同一次 SendInput，才能保证手势不被其它会话插入；
+    /// 坐标必须换算到整个虚拟桌面的 0..65535 归一化空间（多显示器 + DPI 正确）。
+    /// </summary>
+    private static Input AbsoluteMouseMove(int screenX, int screenY)
+    {
+        var left = GetSystemMetrics(SmXVirtualScreen);
+        var top = GetSystemMetrics(SmYVirtualScreen);
+        var width = Math.Max(1, GetSystemMetrics(SmCxVirtualScreen));
+        var height = Math.Max(1, GetSystemMetrics(SmCyVirtualScreen));
+        var nx = (int)Math.Round((screenX - left) * 65535.0 / Math.Max(1, width - 1));
+        var ny = (int)Math.Round((screenY - top) * 65535.0 / Math.Max(1, height - 1));
+        return new Input
+        {
+            Type = 0,
+            Union = new InputUnion
+            {
+                Mouse = new MouseInputData
+                {
+                    X = Math.Clamp(nx, 0, 65535),
+                    Y = Math.Clamp(ny, 0, 65535),
+                    Flags = MouseEventMove | MouseEventAbsolute | MouseEventVirtualDesk,
+                    ExtraInfo = NativeMethods.SwarmInputMarker,
+                },
+            },
+        };
+    }
+
+    private static readonly object SendSync = new();
+
     private static void Send(IEnumerable<Input> inputs)
     {
         var data = inputs.ToArray();
-        if (SendInput((uint)data.Length, data, Marshal.SizeOf<Input>()) != data.Length)
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "Windows 输入执行失败");
+        if (data.Length == 0) return;
+        // SendInput 的“事件不交错”只保证单次调用内；跨会话必须由本进程再串行一次，
+        // 否则 A 会话的 down 与 B 会话的 up 可能被交错成“按下没抬起”。
+        lock (SendSync)
+        {
+            if (SendInput((uint)data.Length, data, Marshal.SizeOf<Input>()) != data.Length)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Windows 输入执行失败");
+        }
+        UserPresenceGuard.NoteSynthetic();
     }
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint SendInput(uint count, Input[] inputs, int size);
 
     [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetCursorPos(int x, int y);
+    private static extern int GetSystemMetrics(int index);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern short VkKeyScan(char character);

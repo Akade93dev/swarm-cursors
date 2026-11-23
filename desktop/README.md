@@ -37,11 +37,13 @@ powershell -File desktop\e2e\run-all.ps1
 cd desktop\renderer; node --test *.test.mjs
 ```
 
-`run-all.ps1` 会先把两个项目以 self-contained 形式发布到 `publish-verify`，再依次运行七个脚本（`p0-routing`、`p1-pixels`、`p1-s-invariants`、`p2-overlay`、`edge-pixels`、`type-focus`、`edge-tiers`），任一断言失败则退出码非 0。
+`run-all.ps1` 会先把两个项目以 self-contained 形式发布到 `publish-verify`，再依次运行八个脚本（`p0-routing`、`p1-pixels`、`p1-s-invariants`、`p2-overlay`、`edge-pixels`、`type-focus`、`edge-tiers`、`concurrency`），任一断言失败则退出码非 0。
 
 `Swarm.Tests/transcripts/*.json` 是 MCP 会话金样本：每份场景声明桌面端行为（`result`/`error`/`progress`/`holdUntilCancelled`/`throw`）和若干步骤；`McpTranscriptTests` 逐步发送请求，按排序后的 JSON 逐字比较通知与响应。新增协议行为时先补样本，再改实现。
 
 `edge-pixels.ps1` 是诊断脚本，只打印 `BEGIN/CLICK/OBSERVE` 观测结果，不设断言。`edge-tiers.ps1` 用 Edge/Chromium 验证动作阶梯：按 `elementId` 对按钮/复选框/单选框/下拉框/输入框各执行一次，再对可滚动页面执行 `scroll`，断言 `tier=uia|message` 占比 ≥ 0.8、`focus` 调用为 0、动作返回的 `foregroundUnchanged` 全为 true，并独立比较每个动作前后的第三方前台根窗口句柄。
+
+`concurrency.ps1` 起 1 个 Desktop + 3 个 Gateway，对三个不同标题的窗口并发 `task_begin`/`observe`/`task_end`：断言 3 个会话的 token、sessionId、目标句柄互不相同，`desktop_status.active=3`，把 A 的 token 交给 B 会被 `unauthorized` 拒绝，第 4 个会话在弹确认框前就返回 `capacity_exceeded`，且确认框不夺取前台焦点。
 
 `p1-s-invariants.ps1` 验证当前显示缩放下的 CSS/物理坐标换算、客户区与 PNG 尺寸、WGC 与强制 `screen` 抓屏对齐，以及取消在 1 秒内返回 `-32800` 且任务/token 可继续使用。未实际运行的 DPI 档位只输出 `SKIP`，不算通过。`run-all` 后可在 Windows 设置中**人工**切换当前显示器缩放（脚本不会修改显示设置），分别补跑：
 
@@ -105,6 +107,7 @@ task_begin  → observe → (focus) → click / type_text / press_key / scroll �
 | `scroll` | `token`、`x`、`y`、`delta`、`label`、`confirmToken` | `delta` 限 ±1200，超限返回 `invalid_params` |
 | `task_end` | `token` | 正常结束 |
 | `task_stop` | `token` | 立即中止 |
+| `desktop_status` | 无 | 只读诊断：活跃会话/容量、隔离形态、抓屏复用、租约队列、UIA 熔断、各 Tier 命中数 |
 
 坐标一律是**窗口客户区 CSS 像素**（`observe` 返回的坐标系），不是屏幕物理像素。`viewport.clientPhysical{x,y,w,h}` 是客户区物理像素位置与尺寸，`viewport.dpiScale` 用于 CSS/物理坐标换算；返回的 PNG 宽高必须等于 `clientPhysical.w/h`。
 

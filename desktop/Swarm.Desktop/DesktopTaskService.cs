@@ -6,6 +6,7 @@ using System.Windows.Automation;
 using System.Windows.Threading;
 using Swarm.Core.Actions;
 using Swarm.Core.Capture;
+using Swarm.Core.Concurrency;
 using Swarm.Core.Diagnostics;
 using Swarm.Core.Governance;
 using Swarm.Core.Operations;
@@ -15,49 +16,40 @@ using Swarm.Core.Semantics;
 
 namespace Swarm.Desktop;
 
+/// <summary>
+/// 桌面侧任务服务：一个 Gateway 进程对应一个 <see cref="TaskSession"/>，会话之间互不阻塞。
+/// 这里只保留无状态共享设施（会话表、窗口租约、确认队列、抓屏、OCR 限流），
+/// 任何原本是服务级单例的可变状态（快照、掩码、策略、确认令牌、审计、计数）都在会话内。
+/// </summary>
 public sealed class DesktopTaskService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan SnapshotTtl = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan WindowLeaseTimeout = TimeSpan.FromSeconds(10);
     private const int WindowDriftThreshold = 8;
+
     private readonly MainWindow _host;
-    private readonly object _sync = new();
-    private readonly TaskAuthorization _authorization = new();
-    private readonly Dictionary<string, TaskCompletionSource> _pending = new();
-    private readonly HashSet<string> _sensitiveElements = new(StringComparer.Ordinal);
+    private readonly SessionRegistry _sessions = new();
+    private readonly LeaseManager _leases = new();
+    private readonly ConfirmationQueue _confirmationQueue = new();
+    // Tesseract 的 Engine 是单图状态机, 并发调用会抛 "Only one image can be processed at once";
+    // 因此 OCR 必须串行 (仍在后台线程, 不占用 UI/窗口租约)。
+    private readonly SemaphoreSlim _ocrGate = new(1, 1);
     private readonly DispatcherTimer _watchdog = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly int _visualLeadMs;
     private readonly int _screenshotMax;
     private readonly double _pixelDiffThreshold;
-    private AuthorizedSession? _session;
-    private ActionCoordinator? _coordinator;
-    private OperationRunner? _operations;
-    private TargetIdentity? _target;
-    private int _gatewayProcessId;
-    private int _generation;
-    private bool _stopping;
-    private bool _manualTakeover;
-    private UiaSnapshot? _lastSnapshot;
-    private WindowCapture? _lastCapture;
-    private DateTimeOffset _observedAt;
-    private long _observationGeneration;
-    private bool _maskAllText;
-    private TaskPolicy _policy = TaskPolicy.Default;
-    private ConfirmationBroker _confirmations = new();
-    private AuditWriter? _audit;
-    private string? _taskId;
-    private string? _targetProcessName;
-    private DateTimeOffset _taskStartedAt;
-    private int _actionCount;
-    private AuditContext _auditContext = new();
 
-    // P1-M Mirror 帧通道: 后台定时器周期性抓帧推给 renderer 做人类 mirror 展示.
+    // Mirror 帧通道：默认关闭；多会话时只镜像最近活跃的那一个，避免 N 路 PNG 压垮 UI 与内存。
     private readonly DispatcherTimer _mirrorPump = new();
+    private readonly SemaphoreSlim _mirrorGate = new(1, 1);
+    private readonly bool _mirrorEnabled;
     private readonly int _mirrorIntervalMs;
-    private readonly SemaphoreSlim _mirrorGate = new(1, 1);  // 防止 encode 慢时 Pump 重入
+    private readonly object _mirrorSync = new();
+    private string? _mirrorSessionId;
+    private int _overlayEpoch;
 
-    // P2 OCR/SoM 视觉兜底: 优先 TesseractOcrService (TesseractOCR 5.5.1 内嵌 Native),
-    // tessdata 缺失时自动 fallback 到 NullOcrService (IsAvailable=false, 不 crash).
+    // OCR 是共享的 CPU 重活，按容量限流（默认 2 路），超过则排队而不是抢占全部核心。
     private readonly IOcrService _ocrService = ResolveOcrService();
 
     private static IOcrService ResolveOcrService()
@@ -79,27 +71,25 @@ public sealed class DesktopTaskService
         _visualLeadMs = ReadSetting("SWARM_VISUAL_LEAD_MS", 90, 0, 2000);
         _screenshotMax = ReadSetting("SWARM_SCREENSHOT_MAX", 1600, 320, 4096);
         _pixelDiffThreshold = ReadSetting("SWARM_PIXEL_DIFF_PERMILLE", 5, 1, 500) / 1000.0;
-        _mirrorIntervalMs = ReadSetting("SWARM_MIRROR_INTERVAL_MS", 200, 50, 2000);
-        _watchdog.Tick += (_, _) => _ = CheckGatewayAsync();
+        _mirrorIntervalMs = ReadSetting("SWARM_MIRROR_INTERVAL_MS", 250, 50, 2000);
+        _mirrorEnabled = ReadFlag("SWARM_MIRROR");
+        _watchdog.Tick += (_, _) => _ = CheckSessionsAsync();
+        _watchdog.Start();
         _mirrorPump.Interval = TimeSpan.FromMilliseconds(_mirrorIntervalMs);
         _mirrorPump.Tick += (_, _) => _ = PumpMirrorFrameAsync();
     }
 
-    public bool IsActive
-    {
-        get
-        {
-            lock (_sync) return _session != null && !_stopping;
-        }
-    }
+    public bool IsActive => _sessions.Count > 0;
 
     public bool TargetOwnsForeground
     {
         get
         {
-            TargetIdentity? target;
-            lock (_sync) target = _target;
-            return target != null && InputDispatcher.IsForeground(target.Handle);
+            foreach (var session in _sessions.All())
+            {
+                if (InputDispatcher.IsForeground(session.Target.Handle)) return true;
+            }
+            return false;
         }
     }
 
@@ -108,7 +98,7 @@ public sealed class DesktopTaskService
         var id = string.Empty;
         string? method = null;
         var started = DateTimeOffset.Now;
-        _auditContext = new AuditContext();
+        TaskSession? session = null;
         try
         {
             using var document = JsonDocument.Parse(json);
@@ -118,36 +108,60 @@ public sealed class DesktopTaskService
             var parameters = root.TryGetProperty("params", out var supplied) && supplied.ValueKind == JsonValueKind.Object
                 ? supplied
                 : JsonSerializer.SerializeToElement(new { });
-            if (method == "task_begin") PrepareAudit();
             if (gatewayProcessId <= 0) throw new UnauthorizedAccessException("无法验证 Gateway 进程");
             // 渲染层不可用时立即降级，动作仍可执行；仅在就绪阶段短暂等待首帧。
             await _host.TryWaitRendererAsync(TimeSpan.FromMilliseconds(400));
             var reporter = new ProgressReporter(progress);
-            object result = method switch
+
+            object result;
+            if (method == "task_begin")
             {
-                "task_begin" => await Begin(parameters, gatewayProcessId, reporter),
-                "observe" => await Observe(parameters, gatewayProcessId, reporter),
-                "click" => await Click(parameters, gatewayProcessId, reporter),
-                "type_text" => await TypeText(parameters, gatewayProcessId, reporter),
-                "press_key" => await PressKey(parameters, gatewayProcessId, reporter),
-                "scroll" => await Scroll(parameters, gatewayProcessId, reporter),
-                "focus" => await Focus(parameters, gatewayProcessId, reporter),
-                "task_end" => await End(Token(parameters), gatewayProcessId, false),
-                "task_stop" => await End(Token(parameters), gatewayProcessId, true),
-                _ => throw new InvalidOperationException($"未知桌面方法：{method}"),
-            };
+                result = await Begin(parameters, gatewayProcessId, reporter, created => session = created);
+            }
+            else if (method == "desktop_status")
+            {
+                result = Status();
+            }
+            else
+            {
+                session = RequireSession(gatewayProcessId);
+                session.AuditContext = new AuditContext();
+                var token = Token(parameters);
+                // 同一会话内串行，保证快照/策略/审计一致；不同会话完全并行。
+                await session.RequestGate.WaitAsync();
+                try
+                {
+                    session.InFlight++;
+                    Validate(token, session);
+                    result = method switch
+                    {
+                        "observe" => await Observe(parameters, session, reporter),
+                        "click" => await Click(parameters, session, reporter),
+                        "type_text" => await TypeText(parameters, session, reporter),
+                        "press_key" => await PressKey(parameters, session, reporter),
+                        "scroll" => await Scroll(parameters, session, reporter),
+                        "focus" => await Focus(parameters, session, reporter),
+                        "task_end" => await End(session, false),
+                        "task_stop" => await End(session, true),
+                        _ => throw new InvalidOperationException($"未知桌面方法：{method}"),
+                    };
+                }
+                finally
+                {
+                    session.InFlight--;
+                    session.RequestGate.Release();
+                }
+            }
             return Success(id, result);
         }
         catch (Exception error)
         {
-            _auditContext.Result = ErrorCode(error);
+            if (session != null) session.AuditContext.Result = ErrorCode(error);
             return Failure(id, error);
         }
         finally
         {
-            WriteAudit(method, started);
-            if (method == "task_begin" && !IsActive) CloseAudit();
-            else if (method is "task_end" or "task_stop") CloseAudit();
+            if (session != null) WriteAudit(session, method, started);
         }
     }
 
@@ -158,147 +172,88 @@ public sealed class DesktopTaskService
 
     public void StopLocal() => _ = StopLocalAsync();
 
-    /// <summary>
-    /// 取消当前在途动作但保留任务、观察与 token；由 Gateway 的控制管道调用。
-    /// 与人工接管不同，不改变观察有效性，也不结束任务。
-    /// </summary>
-    public void CancelCurrent()
+    /// <summary>取消指定 Gateway 的在途动作并保留会话与 token；pid ≤ 0 时取消全部。</summary>
+    public void CancelCurrent(int gatewayProcessId = 0)
     {
-        ActionCoordinator? coordinator;
-        lock (_sync)
+        var targets = gatewayProcessId > 0
+            ? new[] { _sessions.ByGateway(gatewayProcessId) }.Where(session => session != null).Cast<TaskSession>().ToArray()
+            : _sessions.All().ToArray();
+        foreach (var session in targets)
         {
-            if (_session == null || _stopping || _manualTakeover) return;
-            coordinator = _coordinator;
+            if (session.Stopping || session.ManualTakeover) continue;
+            session.Coordinator.CancelCurrent();
         }
-        coordinator?.CancelCurrent();
     }
 
-    /// <summary>低层钩子发现未标记的人工输入后暂停本代次动作；已交给 Win32 的原子输入不承诺撤回。</summary>
+    /// <summary>低层钩子发现未标记的人工输入后暂停所有会话动作；已交给 Win32 的原子输入不承诺撤回。</summary>
     public void PauseForHumanInput()
     {
-        ActionCoordinator? coordinator;
-        OperationRunner? operations;
-        lock (_sync)
+        var paused = new List<TaskSession>();
+        foreach (var session in _sessions.All())
         {
-            if (_session == null || _stopping || _manualTakeover) return;
-            coordinator = _coordinator;
-            operations = _operations;
-            _manualTakeover = true;
-            _lastSnapshot = null;
-            _lastCapture = null;
-            _observedAt = default;
+            if (session.Stopping || session.ManualTakeover) continue;
+            session.ManualTakeover = true;
+            session.LastSnapshot = null;
+            session.LastCapture = null;
+            session.ObservedAt = default;
+            session.Coordinator.Pause();
+            session.Operations.ReportControl("paused");
+            paused.Add(session);
         }
-        coordinator?.Pause();
-        operations?.ReportControl("paused");
+        if (paused.Count == 0) return;
         _host.PostMessage(new { type = "task-status", text = "人工接管中：AI 输入已暂停；按 Ctrl+Alt+Shift+R 恢复，恢复后请重新 observe" });
     }
 
     /// <summary>只允许本地热键调用；恢复后旧观察不可用，AI 必须重新 observe。</summary>
     public void ResumeLocal()
     {
-        OperationRunner? operations;
-        lock (_sync)
+        var resumed = new List<TaskSession>();
+        foreach (var session in _sessions.All())
         {
-            if (_session == null || _stopping || !_manualTakeover) return;
-            _coordinator?.Resume();
-            _manualTakeover = false;
-            _lastSnapshot = null;
-            _lastCapture = null;
-            _observedAt = default;
-            operations = _operations;
+            if (session.Stopping || !session.ManualTakeover) continue;
+            session.Coordinator.Resume();
+            session.ManualTakeover = false;
+            session.LastSnapshot = null;
+            session.LastCapture = null;
+            session.ObservedAt = default;
+            session.Operations.ReportControl("running");
+            resumed.Add(session);
         }
-        operations?.ReportControl("running");
+        if (resumed.Count == 0) return;
+        // 恢复热键本身就是“真实输入”，不划出去的话紧接着的 Tier C 会被空闲门控误挡。
+        UserPresenceGuard.MarkResumed();
         _host.PostMessage(new { type = "task-status", text = "已恢复 AI 控制；旧观察已失效，请重新 observe" });
     }
 
-    public async Task StopLocalAsync(bool keepAudit = false)
+    public async Task StopLocalAsync()
     {
-        StopMirror();
-        OperationRunner? operations;
-        ActionCoordinator? coordinator;
-        int generation;
-        lock (_sync)
+        lock (_mirrorSync)
         {
-            if (_stopping) return;
-            _stopping = true;
-            operations = _operations;
-            _operations = null;
-            coordinator = _coordinator;
-            _coordinator = null;
-            generation = ++_generation;
+            _mirrorSessionId = null;
+            _mirrorPump.Stop();
         }
-
-        _watchdog.Stop();
-        if (operations != null)
-        {
-            try
-            {
-                await operations.StopAsync(TimeSpan.FromMilliseconds(800));
-            }
-            catch
-            {
-                // 收尾阶段的异常不应阻止释放会话。
-            }
-        }
-
-        coordinator?.Stop();
-        List<TaskCompletionSource> pending;
-        lock (_sync)
-        {
-            pending = _pending.Values.ToList();
-            _pending.Clear();
-        }
-        foreach (var pendingItem in pending) pendingItem.TrySetCanceled();
-        _authorization.Stop();
-
-        lock (_sync)
-        {
-            _session = null;
-            _target = null;
-            _gatewayProcessId = 0;
-            _lastSnapshot = null;
-            _lastCapture = null;
-            _observedAt = default;
-            _sensitiveElements.Clear();
-            _maskAllText = false;
-            _manualTakeover = false;
-            _policy = TaskPolicy.Default;
-            _confirmations = new ConfirmationBroker();
-            _actionCount = 0;
-            _targetProcessName = null;
-            // 排空与本轮清理完成后才允许下一次 task_begin，避免复位过早导致两个会话重叠。
-            _stopping = false;
-        }
-        if (!keepAudit) CloseAudit();
-
-        // 保留覆盖层一小段时间展示结束摘要，再隐藏；若期间已开始新任务则不隐藏。
-        await Task.Delay(TimeSpan.FromMilliseconds(1200));
-        bool stillStopped;
-        lock (_sync) stillStopped = _generation == generation && _session == null;
-        if (stillStopped) _host.HideTaskOverlay();
+        foreach (var session in _sessions.All()) await StopSessionAsync(session);
     }
 
-    private async Task<object> Begin(JsonElement parameters, int gatewayProcessId, ProgressReporter progress)
+    private async Task<object> Begin(JsonElement parameters, int gatewayProcessId, ProgressReporter progress, Action<TaskSession> created)
     {
-        lock (_sync)
-        {
-            if (_session != null) throw new InvalidOperationException("已有 AI 桌面任务正在运行");
-            if (_stopping) throw new InvalidOperationException("上一个任务正在停止，请稍后重试");
-        }
+        if (_sessions.ByGateway(gatewayProcessId) != null)
+            throw new DesktopOperationException("already_running", "该 Gateway 已有 AI 桌面任务正在运行");
+        if (_sessions.Count >= _sessions.Capacity)
+            throw new DesktopOperationException("capacity_exceeded", $"已达到并发会话上限 {_sessions.Capacity}，请先结束其它任务");
 
         var policy = TaskPolicy.Parse(parameters);
         var candidate = WindowLocator.Find(OptionalString(parameters, "targetProcess"), OptionalString(parameters, "targetTitle"), _host.NativeHandle);
-        _auditContext.Target = new AuditTarget(candidate.ProcessName, AuditHash.Sha256(candidate.Title), "window");
         var beginDecision = PolicyEvaluator.Begin(policy, candidate.ProcessName, candidate.Title);
         if (!beginDecision.Allowed)
-        {
-            _auditContext.Decision = "denied:" + beginDecision.Reason;
             throw new DesktopOperationException("policy_denied", $"任务策略拒绝目标：{beginDecision.Reason}");
-        }
-        var approved = _host.ConfirmLocal(
+
+        var approved = await _confirmationQueue.AskAsync(
+            _host,
             "Swarm AI 操作授权",
             $"允许当前 Trae 只读取并操作此应用的窗口内容？\n\n应用：{candidate.ProcessName} ({candidate.ProcessId})\n窗口：{candidate.Title}\n\n任务中不会主动抢走其它程序焦点；窗口被遮挡时优先使用窗口消息。可显示观察、点击、输入和结果。危险操作仍会再次询问，目标在前台时 Esc 可急停。",
-            false);
+            false,
+            CancellationToken.None);
         if (!approved) throw new UnauthorizedAccessException("用户未授权本次 AI 桌面任务");
 
         await progress.Report(0.1, "capture");
@@ -320,63 +275,62 @@ public sealed class DesktopTaskService
         }
         var identity = new TargetIdentity(candidate.Handle, (int)processId, startTime, NativeMethods.WindowClass(candidate.Handle) ?? string.Empty);
 
-        lock (_sync)
+        var session = new TaskSession
         {
-            _generation++;
-            _stopping = false;
-            _manualTakeover = false;
-            _session = _authorization.Start($"{candidate.ProcessName}: {candidate.Title}", candidate.ProcessId);
-            _coordinator = new ActionCoordinator();
-            _operations = new OperationRunner(new HostOperationObserver(_host));
-            _operations.BeginSession($"{candidate.ProcessName}: {candidate.Title}", $"pid {candidate.ProcessId}");
-            _target = identity;
-            _gatewayProcessId = gatewayProcessId;
-            _lastSnapshot = null;
-            _lastCapture = null;
-            _observedAt = default;
-            _policy = policy;
-            _taskStartedAt = DateTimeOffset.Now;
-            _actionCount = 0;
-            _confirmations = new ConfirmationBroker();
-            _targetProcessName = candidate.ProcessName;
+            Id = Guid.NewGuid().ToString("N"),
+            GatewayProcessId = gatewayProcessId,
+            Token = Guid.NewGuid().ToString("N"),
+            Target = identity,
+            TargetProcessName = candidate.ProcessName,
+            TargetTitle = candidate.Title,
+            Policy = policy,
+            Operations = new OperationRunner(new HostOperationObserver(_host)),
+        };
+        session.AuditContext.Target = new AuditTarget(candidate.ProcessName, AuditHash.Sha256(candidate.Title), "window");
+        session.Audit = new AuditWriter(AuditWriter.DefaultDirectory, session.TaskId);
+        if (_sessions.TryAdd(session, out var errorCode) == null)
+        {
+            session.Audit.Dispose();
+            throw new DesktopOperationException(errorCode ?? "capacity_exceeded", "无法创建新的桌面任务会话");
         }
+        created(session);
+
+        session.Operations.BeginSession($"{candidate.ProcessName}: {candidate.Title}", $"pid {candidate.ProcessId}");
+        _overlayEpoch++;
+        TouchMirror(session);
 
         _host.ShowTaskOverlay(capture.Monitor, capture.DpiScale);
         _host.PostMessage(new { type = "task-status", text = $"已授权：{candidate.ProcessName}，目标在前台时 Esc 急停" });
-        _watchdog.Start();
-        StartMirror();
-        FileLog.Write("desktop", $"task begin pid={candidate.ProcessId} process={candidate.ProcessName} title={candidate.Title} capture={capture.Backend}");
+        FileLog.Write("desktop", $"task begin pid={candidate.ProcessId} ts={session.Id} process={candidate.ProcessName} title={candidate.Title} capture={capture.Backend}");
         try
         {
-            return await ObserveInternal(includeScreenshot: true, progress);
+            return await ObserveInternal(session, includeScreenshot: true, progress);
         }
         catch
         {
             // Begin 失败必须回滚已写入的会话，否则之后每次 task_begin 都会被“已有任务”拒绝。
-            try { await StopLocalAsync(keepAudit: true); }
+            try { await StopSessionAsync(session); }
             catch (Exception cleanup) { FileLog.Write("desktop", $"begin rollback failed: {cleanup.Message}"); }
             throw;
         }
     }
 
-    private async Task<object> Observe(JsonElement parameters, int gatewayProcessId, ProgressReporter progress)
+    private async Task<object> Observe(JsonElement parameters, TaskSession session, ProgressReporter progress)
     {
-        Validate(Token(parameters), gatewayProcessId);
         var include = OptionalBool(parameters, "includeScreenshot");
-        return await ObserveInternal(include, progress);
+        return await ObserveInternal(session, include, progress);
     }
 
-    private async Task<object> ObserveInternal(bool includeScreenshot, ProgressReporter? progress = null)
+    private async Task<object> ObserveInternal(TaskSession session, bool includeScreenshot, ProgressReporter? progress = null)
     {
-        var identity = CurrentTarget();
+        var identity = session.Target;
         EnsureIdentity(identity);
         var capture = await CaptureService.CaptureAsync(identity.Handle);
         if (progress != null) await progress.Report(0.2, "capture");
         if (capture.Backend == "screen")
             FileLog.Write("desktop", $"capture fallback handle=0x{identity.Handle:x} occluded={capture.Occluded} blank={capture.Blank}");
         UiaSnapshot? snapshot = null;
-        long observation;
-        lock (_sync) observation = ++_observationGeneration;
+        var observation = ++session.ObservationGeneration;
         // 两种降级语义分开：backend=screen 是真的没用窗口抓屏；occluded 只是目标不在前台或被遮挡。
         string? warning = capture.Backend == "screen"
             ? "窗口抓屏不可用，已降级为屏幕裁剪；截图可能包含其他窗口"
@@ -385,7 +339,9 @@ public sealed class DesktopTaskService
                 : null;
         try
         {
-            snapshot = await Task.Run(() => UiaSnapshotReader.Read(identity.Handle, new UiaSnapshotOptions(IncludePatterns: true, FirstPassMilliseconds: 800, Generation: observation)));
+            snapshot = await UiaWatchdog.ReadAsync(identity.Handle, identity.ProcessId, observation, CancellationToken.None);
+            if (snapshot == null && UiaWatchdog.IsQuarantined(identity.ProcessId))
+                warning = warning == null ? "UIA 读取超时，已临时熔断该进程的 UIA，改用视觉兜底" : $"{warning}；UIA 读取超时，已临时熔断";
         }
         catch (InvalidOperationException error) when (error.Message.Contains("最小化", StringComparison.Ordinal))
         {
@@ -420,7 +376,9 @@ public sealed class DesktopTaskService
         {
             try
             {
-                ocrLines = await _ocrService.OcrAsync(capture.Frame);
+                await _ocrGate.WaitAsync();
+                try { ocrLines = await _ocrService.OcrAsync(capture.Frame); }
+                finally { _ocrGate.Release(); }
             }
             catch (Exception ocrErr)
             {
@@ -461,20 +419,21 @@ public sealed class DesktopTaskService
 
         if (progress != null) await progress.Report(0.55, "uia");
 
-        var redactionOptions = _policy.EffectiveRedaction;
+        var redactionOptions = session.Policy.EffectiveRedaction;
         var hits = snapshot == null
             ? Array.Empty<RedactionHit>()
             : RedactionDetector.Detect(redactionOptions, snapshot.Elements).ToArray();
         var hitByElement = new Dictionary<string, RedactionHit>(StringComparer.Ordinal);
         foreach (var hit in hits) hitByElement[hit.ElementId] = hit;
 
-        lock (_sync)
+        lock (session)
         {
-            _lastCapture = capture;
-            _lastSnapshot = snapshot;
-            _observedAt = DateTimeOffset.Now;
+            session.LastCapture = capture;
+            session.LastSnapshot = snapshot;
+            session.ObservedAt = DateTimeOffset.Now;
         }
         _host.ShowTaskOverlay(capture.Monitor, capture.DpiScale);
+        TouchMirror(session);
 
         var dpi = capture.DpiScale;
         var client = capture.ClientBounds;
@@ -492,7 +451,7 @@ public sealed class DesktopTaskService
                 var bounds = CoordinateConverter.ToClient(element.Bounds, clientScreen, dpi);
                 hitByElement.TryGetValue(element.Id, out var hit);
                 var maskedByPolicy = hit != null;
-                var sensitive = maskedByPolicy || element.IsPassword || _sensitiveElements.Contains(ElementId.Stable(element.Id)) || (_maskAllText && element.ControlType.Equals("Edit", StringComparison.OrdinalIgnoreCase));
+                var sensitive = maskedByPolicy || element.IsPassword || session.SensitiveElements.Contains(ElementId.Stable(element.Id)) || (session.MaskAllText && element.ControlType.Equals("Edit", StringComparison.OrdinalIgnoreCase));
                 return new
                 {
                     id = element.Id,
@@ -509,7 +468,7 @@ public sealed class DesktopTaskService
                 };
             }).ToArray() ?? Array.Empty<object>();
 
-        foreach (var hit in hits) _auditContext.Redactions.Add(new AuditRedaction(hit.Category, hit.Risk, hit.Necessary));
+        foreach (var hit in hits) session.AuditContext.Redactions.Add(new AuditRedaction(hit.Category, hit.Risk, hit.Necessary));
         var redactionViews = hits.Select(hit =>
         {
             var bounds = CoordinateConverter.ToClient(hit.Bounds, clientScreen, dpi);
@@ -544,7 +503,8 @@ public sealed class DesktopTaskService
         if (progress != null) await progress.Report(0.95, "done");
         return new
         {
-            token = _session?.Token,
+            token = session.Token,
+            sessionId = session.Id,
             target = new
             {
                 processId = identity.ProcessId,
@@ -601,11 +561,10 @@ public sealed class DesktopTaskService
         };
     }
 
-    private async Task<object> Click(JsonElement parameters, int gatewayProcessId, ProgressReporter progress)
+    private async Task<object> Click(JsonElement parameters, TaskSession session, ProgressReporter progress)
     {
-        var session = Validate(Token(parameters), gatewayProcessId);
-        var identity = CurrentTarget();
-        var (snapshot, capture) = Observation();
+        var identity = session.Target;
+        var (snapshot, capture) = Observation(session);
         EnsureWindowStable(capture);
         var elementId = OptionalString(parameters, "elementId");
         var element = Element(elementId, snapshot);
@@ -621,19 +580,19 @@ public sealed class DesktopTaskService
         var explicitLabel = OptionalString(parameters, "label");
         var label = explicitLabel ?? (element != null ? $"点击 {element.Name ?? element.ControlType}" : "点击坐标");
         var crossApp = IsCrossApp(element, identity);
-        CheckPolicy("click", crossApp);
-        SetActionAudit(label, element);
+        CheckPolicy(session, "click", crossApp);
+        SetActionAudit(session, label, element);
         // 只看调用方显式给出的 label；屏幕元素名不参与策略判定，避免被界面文字注入。
-        if (RequiresConfirmation(ActionClassifier.Classify(explicitLabel), crossApp))
+        if (RequiresConfirmation(session, ActionClassifier.Classify(explicitLabel), crossApp))
         {
-            var pending = RequestConfirmation(parameters, "click", $"点击：{label}");
+            var pending = RequestConfirmation(session, parameters, "click", $"点击：{label}");
             if (pending != null) return pending;
         }
         else
         {
-            await ConfirmDanger(label, element?.ControlType, null);
+            await ConfirmDanger(session, label, element?.ControlType, null);
         }
-        _actionCount++;
+        session.ActionCount++;
         var actionId = NewActionId();
         var action = new
         {
@@ -646,18 +605,17 @@ public sealed class DesktopTaskService
             label,
         };
         await progress.Report(0.3, "execute");
-        var outcome = await RunAction(actionId, "click", label, action, token =>
-            RunWithPixelVerification(identity.Handle, verify, region,
+        var outcome = await RunAction(session, actionId, "click", label, action, token =>
+            RunWithPixelVerification(session, identity.Handle, verify, region,
                 inner => InputDispatcher.ClickAsync(identity.Handle, snapshot, elementId, screen.X, screen.Y, true, inner), token));
         await progress.Report(0.7, verify ? "verify" : "execute");
-        return await AfterAction(actionId, outcome, OptionalBool(parameters, "observe"), progress);
+        return await AfterAction(session, actionId, outcome, OptionalBool(parameters, "observe"), progress);
     }
 
-    private async Task<object> TypeText(JsonElement parameters, int gatewayProcessId, ProgressReporter progress)
+    private async Task<object> TypeText(JsonElement parameters, TaskSession session, ProgressReporter progress)
     {
-        var session = Validate(Token(parameters), gatewayProcessId);
-        var identity = CurrentTarget();
-        var (snapshot, capture) = Observation();
+        var identity = session.Target;
+        var (snapshot, capture) = Observation(session);
         EnsureWindowStable(capture);
         var text = RequiredString(parameters, "text");
         if (text.Length > 10000) throw new ArgumentException("单次输入不能超过 10000 个字符");
@@ -671,20 +629,20 @@ public sealed class DesktopTaskService
         var region = element != null ? ElementRegion(element, capture) : new RectInt(0, 0, capture.ClientBounds.Width, capture.ClientBounds.Height);
         if (sensitive)
         {
-            if (elementId != null) _sensitiveElements.Add(ElementId.Stable(elementId));
-            else _maskAllText = true;
+            if (elementId != null) session.SensitiveElements.Add(ElementId.Stable(elementId));
+            else session.MaskAllText = true;
         }
         var screen = ToScreen(geometry.CursorX, geometry.CursorY, capture);
         var label = sensitive ? "输入受保护文本" : $"输入：{text.Substring(0, Math.Min(60, text.Length))}";
         var crossApp = IsCrossApp(element, identity);
-        CheckPolicy("type_text", crossApp);
-        SetActionAudit(text, element);
-        if (RequiresConfirmation(null, crossApp))
+        CheckPolicy(session, "type_text", crossApp);
+        SetActionAudit(session, text, element);
+        if (RequiresConfirmation(session, null, crossApp))
         {
-            var pending = RequestConfirmation(parameters, "type_text", $"输入文本：{label}");
+            var pending = RequestConfirmation(session, parameters, "type_text", $"输入文本：{label}");
             if (pending != null) return pending;
         }
-        _actionCount++;
+        session.ActionCount++;
         var actionId = NewActionId();
         var action = new
         {
@@ -698,32 +656,31 @@ public sealed class DesktopTaskService
             sensitive,
         };
         await progress.Report(0.3, "execute");
-        var outcome = await RunAction(actionId, "type", label, action, token =>
-            RunWithPixelVerification(identity.Handle, verify, region,
+        var outcome = await RunAction(session, actionId, "type", label, action, token =>
+            RunWithPixelVerification(session, identity.Handle, verify, region,
                 inner => InputDispatcher.TypeTextAsync(identity.Handle, snapshot, elementId, text, screen.X, screen.Y, true, inner), token));
         await progress.Report(0.7, verify ? "verify" : "execute");
-        return await AfterAction(actionId, outcome, OptionalBool(parameters, "observe"), progress);
+        return await AfterAction(session, actionId, outcome, OptionalBool(parameters, "observe"), progress);
     }
 
-    private async Task<object> PressKey(JsonElement parameters, int gatewayProcessId, ProgressReporter progress)
+    private async Task<object> PressKey(JsonElement parameters, TaskSession session, ProgressReporter progress)
     {
-        var session = Validate(Token(parameters), gatewayProcessId);
-        var identity = CurrentTarget();
-        var (snapshot, capture) = Observation();
+        var identity = session.Target;
+        var (snapshot, capture) = Observation(session);
         EnsureWindowStable(capture);
         var key = RequiredString(parameters, "key");
-        CheckPolicy("press_key", false);
-        SetActionAudit(key, null);
-        if (RequiresConfirmation(ActionClassifier.Classify(null, key), false))
+        CheckPolicy(session, "press_key", false);
+        SetActionAudit(session, key, null);
+        if (RequiresConfirmation(session, ActionClassifier.Classify(null, key), false))
         {
-            var pending = RequestConfirmation(parameters, "press_key", $"按键：{key}");
+            var pending = RequestConfirmation(session, parameters, "press_key", $"按键：{key}");
             if (pending != null) return pending;
         }
         else
         {
-            await ConfirmDanger($"按键 {key}", "keyboard", key);
+            await ConfirmDanger(session, $"按键 {key}", "keyboard", key);
         }
-        _actionCount++;
+        session.ActionCount++;
         var verify = PixelVerify(parameters);
         var region = new RectInt(0, 0, capture.ClientBounds.Width, capture.ClientBounds.Height);
         var geometry = WindowGeometry(capture);
@@ -740,21 +697,20 @@ public sealed class DesktopTaskService
             label = $"按键：{key}",
         };
         await progress.Report(0.3, "execute");
-        var outcome = await RunAction(actionId, "key", $"按键：{key}", action, token =>
-            RunWithPixelVerification(identity.Handle, verify, region,
+        var outcome = await RunAction(session, actionId, "key", $"按键：{key}", action, token =>
+            RunWithPixelVerification(session, identity.Handle, verify, region,
                 inner => InputDispatcher.PressKeyAsync(identity.Handle, snapshot, key, screen.X, screen.Y, true, inner), token));
         await progress.Report(0.7, verify ? "verify" : "execute");
-        return await AfterAction(actionId, outcome, OptionalBool(parameters, "observe"), progress);
+        return await AfterAction(session, actionId, outcome, OptionalBool(parameters, "observe"), progress);
     }
 
-    private async Task<object> Scroll(JsonElement parameters, int gatewayProcessId, ProgressReporter progress)
+    private async Task<object> Scroll(JsonElement parameters, TaskSession session, ProgressReporter progress)
     {
-        var session = Validate(Token(parameters), gatewayProcessId);
-        var identity = CurrentTarget();
-        var (snapshot, capture) = Observation();
+        var identity = session.Target;
+        var (snapshot, capture) = Observation(session);
         EnsureWindowStable(capture);
-        CheckPolicy("scroll", false);
-        SetActionAudit(null, null);
+        CheckPolicy(session, "scroll", false);
+        SetActionAudit(session, null, null);
         var x = RequiredNumber(parameters, "x");
         var y = RequiredNumber(parameters, "y");
         var delta = RequiredNumber(parameters, "delta");
@@ -764,7 +720,7 @@ public sealed class DesktopTaskService
         var region = new RectInt(0, 0, capture.ClientBounds.Width, capture.ClientBounds.Height);
         var geometry = PointGeometry(x, y, capture);
         var screen = ToScreen(geometry.CursorX, geometry.CursorY, capture);
-        _actionCount++;
+        session.ActionCount++;
         var actionId = NewActionId();
         var action = new
         {
@@ -778,23 +734,22 @@ public sealed class DesktopTaskService
             label = $"滚动 {scrollDelta}",
         };
         await progress.Report(0.3, "execute");
-        var outcome = await RunAction(actionId, "scroll", $"滚动 {scrollDelta}", action, token =>
-            RunWithPixelVerification(identity.Handle, verify, region,
+        var outcome = await RunAction(session, actionId, "scroll", $"滚动 {scrollDelta}", action, token =>
+            RunWithPixelVerification(session, identity.Handle, verify, region,
                 inner => InputDispatcher.ScrollAsync(identity.Handle, snapshot, screen.X, screen.Y, scrollDelta, true, inner), token));
         await progress.Report(0.7, verify ? "verify" : "execute");
-        return await AfterAction(actionId, outcome, OptionalBool(parameters, "observe"), progress);
+        return await AfterAction(session, actionId, outcome, OptionalBool(parameters, "observe"), progress);
     }
 
-    private async Task<object> Focus(JsonElement parameters, int gatewayProcessId, ProgressReporter progress)
+    private async Task<object> Focus(JsonElement parameters, TaskSession session, ProgressReporter progress)
     {
-        Validate(Token(parameters), gatewayProcessId);
-        var identity = CurrentTarget();
-        var capture = _lastCapture ?? throw new InvalidOperationException("请先 observe");
+        var identity = session.Target;
+        var capture = session.LastCapture ?? throw new InvalidOperationException("请先 observe");
         EnsureWindowStable(capture);
-        CheckPolicy("focus", false);
-        SetActionAudit(null, null);
+        CheckPolicy(session, "focus", false);
+        SetActionAudit(session, null, null);
         var geometry = WindowGeometry(capture);
-        _actionCount++;
+        session.ActionCount++;
         var actionId = NewActionId();
         var action = new
         {
@@ -807,48 +762,32 @@ public sealed class DesktopTaskService
             label = "切换到目标窗口",
         };
         await progress.Report(0.3, "execute");
-        var outcome = await RunAction(actionId, "focus", "切换到目标窗口", action, token =>
+        var outcome = await RunAction(session, actionId, "focus", "切换到目标窗口", action, token =>
         {
             token.ThrowIfCancellationRequested();
-            return Task.FromResult(InputDispatcher.Focus(identity.Handle));
+            return RunMutating(session, identity.Handle, _ => Task.FromResult(InputDispatcher.Focus(identity.Handle)), token);
         });
         await progress.Report(0.7, "execute");
-        return await AfterAction(actionId, outcome, OptionalBool(parameters, "observe"), progress);
+        return await AfterAction(session, actionId, outcome, OptionalBool(parameters, "observe"), progress);
     }
 
-    private async Task<object> End(string token, int gatewayProcessId, bool stopped)
+    private async Task<object> End(TaskSession session, bool stopped)
     {
-        Validate(token, gatewayProcessId);
-        await StopLocalAsync(keepAudit: true);
+        await StopSessionAsync(session);
         FileLog.Write("desktop", stopped ? "task stop" : "task end");
-        return new { ok = true, stopped };
+        return new { ok = true, stopped, sessionId = session.Id };
     }
 
-    private AuthorizedSession Validate(string token, int gatewayProcessId)
-    {
-        AuthorizedSession? session;
-        int expectedGateway;
-        lock (_sync)
-        {
-            session = _session;
-            expectedGateway = _gatewayProcessId;
-            if (_stopping) throw new DesktopOperationException("stopped", "任务正在停止");
-            if (_manualTakeover) throw new DesktopOperationException("manual_takeover", "人工接管中；本地恢复后请重新 observe");
-        }
-        if (session == null || gatewayProcessId != expectedGateway) throw new UnauthorizedAccessException("Gateway 或任务会话无效");
-        var identity = CurrentTarget();
-        EnsureIdentity(identity);
-        NativeMethods.GetWindowThreadProcessId(identity.Handle, out var processId);
-        return _authorization.Validate(token, (int)processId);
-    }
+    private TaskSession RequireSession(int gatewayProcessId) =>
+        _sessions.ByGateway(gatewayProcessId) ?? throw new UnauthorizedAccessException("Gateway 或任务会话无效");
 
-    private TargetIdentity CurrentTarget()
+    private static void Validate(string token, TaskSession session)
     {
-        lock (_sync)
-        {
-            if (_target == null) throw new UnauthorizedAccessException("任务会话无效");
-            return _target;
-        }
+        if (session.Stopping) throw new DesktopOperationException("stopped", "任务正在停止");
+        if (session.ManualTakeover) throw new DesktopOperationException("manual_takeover", "人工接管中；本地恢复后请重新 observe");
+        if (!string.Equals(session.Token, token, StringComparison.Ordinal))
+            throw new UnauthorizedAccessException("Gateway 或任务会话无效");
+        EnsureIdentity(session.Target);
     }
 
     private static void EnsureIdentity(TargetIdentity identity)
@@ -872,14 +811,14 @@ public sealed class DesktopTaskService
         }
     }
 
-    private (UiaSnapshot? Snapshot, WindowCapture Capture) Observation()
+    private static (UiaSnapshot? Snapshot, WindowCapture Capture) Observation(TaskSession session)
     {
-        lock (_sync)
+        lock (session)
         {
-            if (_lastCapture == null) throw new InvalidOperationException("请先 observe");
-            if (DateTimeOffset.Now - _observedAt > SnapshotTtl)
+            if (session.LastCapture == null) throw new InvalidOperationException("请先 observe");
+            if (DateTimeOffset.Now - session.ObservedAt > SnapshotTtl)
                 throw new DesktopOperationException("stale_observation", "观察已过期，请重新 observe");
-            return (_lastSnapshot, _lastCapture);
+            return (session.LastSnapshot, session.LastCapture);
         }
     }
 
@@ -919,6 +858,7 @@ public sealed class DesktopTaskService
     }
 
     private async Task<ActionOutcome> RunAction(
+        TaskSession session,
         string id,
         string kind,
         string label,
@@ -928,22 +868,17 @@ public sealed class DesktopTaskService
         ActionOutcome? outcome = null;
         try
         {
-            var operations = _operations;
-            var coordinator = _coordinator;
-            if (operations?.Session == null || coordinator == null)
-                throw new DesktopOperationException("stopped", "任务已停止");
             var step = new OperationStep { Id = id, Kind = OperationStep.ParseKind(kind), Label = label };
-            await operations.RunAsync(
+            await session.Operations.RunAsync(
                 step,
-                token => coordinator.RunAsync(
-                    inner => VisualLead(visual, inner),
-                    async inner =>
-                    {
-                        var result = await body(inner);
-                        outcome = result;
-                        step.ReportTransport(result.Tier, result.Verified, result.Note, result.Evidence);
-                    },
-                    token),
+                async token =>
+                {
+                    // 视觉提前量与像素验证都在临界区之外：全局动作锁只覆盖真正改变 UI 的那一小段。
+                    await VisualLead(visual, token);
+                    var result = await body(token);
+                    outcome = result;
+                    step.ReportTransport(result.Tier, result.Verified, result.Note, result.Evidence);
+                },
                 TimeSpan.FromSeconds(20));
             _host.PostMessage(new
             {
@@ -961,7 +896,11 @@ public sealed class DesktopTaskService
                     foregroundRestored = outcome?.ForegroundRestored ?? false,
                 },
             });
-            if (outcome != null) _auditContext.Tier = outcome.Tier.ToString().ToLowerInvariant();
+            if (outcome != null)
+            {
+                session.AuditContext.Tier = outcome.Tier.ToString().ToLowerInvariant();
+                TierCounters.Record(outcome.Tier);
+            }
             return outcome ?? new ActionOutcome(InputTier.None, false);
         }
         catch (Exception error)
@@ -971,37 +910,68 @@ public sealed class DesktopTaskService
         }
     }
 
+    /// <summary>写动作先取窗口租约（同窗口串行、不同窗口并行），再进全局动作临界区。</summary>
+    private async Task<ActionOutcome> RunMutating(TaskSession session, nint window, Func<CancellationToken, Task<ActionOutcome>> body, CancellationToken token)
+    {
+        using var lease = await AcquireWindowLeaseAsync(session, window, token);
+        return await MutateUnderLease(session, window, body, token);
+    }
+
+    private async Task<ActionOutcome> MutateUnderLease(TaskSession session, nint window, Func<CancellationToken, Task<ActionOutcome>> body, CancellationToken token)
+    {
+        var cursor = CursorRestore.Capture();
+        try
+        {
+            var outcome = await session.Coordinator.RunAsync(_ => Task.CompletedTask, body, token);
+            // 写动作让该窗口的缓存帧与在途观察失效，后续抓屏一定拿到新画面。
+            session.WriteGeneration++;
+            CaptureService.Invalidate(window);
+            return outcome;
+        }
+        finally
+        {
+            CursorRestore.RestoreIfIdle(cursor);
+        }
+    }
+
+    private async Task<IDisposable> AcquireWindowLeaseAsync(TaskSession session, nint window, CancellationToken token)
+    {
+        try
+        {
+            return await _leases.AcquireWindowAsync(window, session.Id, WindowLeaseTimeout, token);
+        }
+        catch (LeaseTimeoutException)
+        {
+            throw new DesktopOperationException("window_busy", "同一窗口的其它会话正在操作，请稍后重试", "lease_timeout");
+        }
+    }
+
     /// <summary>只推进可视化，不等待渲染层确认；最多占用配置的视觉提前量。</summary>
     private async Task VisualLead(object action, CancellationToken token)
     {
         _host.PostMessage(new { type = "action-prepare", action });
         var lead = _visualLeadMs;
         if (lead <= 0) return;
-        try
-        {
-            await Task.Delay(lead, token);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
+        await Task.Delay(lead, token);
     }
 
     /// <summary>
     /// 显式像素验证：动作前取帧，动作后连续两帧确认画面稳定，再比较目标区域的变化比例。
-    /// 只有“画面稳定且变化超过阈值”才判 verified；已有回读证据时不降级。
+    /// before/after 抓屏都在动作临界区之外，只占用窗口租约，避免把 240ms 采样塞进全局锁。
     /// </summary>
     private async Task<ActionOutcome> RunWithPixelVerification(
+        TaskSession session,
         nint window,
         bool verify,
         RectInt region,
         Func<CancellationToken, Task<ActionOutcome>> body,
         CancellationToken token)
     {
-        if (!verify) return await body(token);
+        using var lease = await AcquireWindowLeaseAsync(session, window, token);
+        if (!verify) return await MutateUnderLease(session, window, body, token);
 
         var before = await CaptureService.CaptureAsync(window, token, allowReuse: false);
-        var outcome = await body(token);
+        var outcome = await MutateUnderLease(session, window, body, token);
         await Task.Delay(120, token);
         var first = await CaptureService.CaptureAsync(window, token, allowReuse: false);
         await Task.Delay(120, token);
@@ -1083,7 +1053,7 @@ public sealed class DesktopTaskService
         return new RectInt(left, top, right - left, bottom - top);
     }
 
-    private async Task<object> AfterAction(string actionId, ActionOutcome outcome, bool observe, ProgressReporter? progress = null)
+    private async Task<object> AfterAction(TaskSession session, string actionId, ActionOutcome outcome, bool observe, ProgressReporter? progress = null)
     {
         var tier = outcome.Tier.ToString().ToLowerInvariant();
         FileLog.Write("desktop", $"action {actionId} tier={tier} verified={outcome.Verified} evidence={outcome.Evidence ?? "none"}");
@@ -1112,7 +1082,7 @@ public sealed class DesktopTaskService
                 note = outcome.Note,
                 foregroundUnchanged = outcome.ForegroundUnchanged,
                 foregroundRestored = outcome.ForegroundRestored,
-                observation = await ObserveInternal(false, progress),
+                observation = await ObserveInternal(session, false, progress),
             };
         }
         catch (Exception error)
@@ -1136,79 +1106,63 @@ public sealed class DesktopTaskService
         element != null && element.ProcessId > 0 && element.ProcessId != identity.ProcessId;
 
     /// <summary>只依据策略与计时/计数事实判定，不读取界面文字。</summary>
-    private void CheckPolicy(string kind, bool crossApp)
+    private static void CheckPolicy(TaskSession session, string kind, bool crossApp)
     {
-        var decision = PolicyEvaluator.Action(_policy, kind, DateTimeOffset.Now - _taskStartedAt, _actionCount, crossApp);
+        var decision = PolicyEvaluator.Action(session.Policy, kind, DateTimeOffset.Now - session.TaskStartedAt, session.ActionCount, crossApp);
         if (decision.Allowed) return;
-        _auditContext.Decision = "denied:" + decision.Reason;
+        session.AuditContext.Decision = "denied:" + decision.Reason;
         throw new DesktopOperationException("policy_denied", $"任务策略拒绝本次动作：{decision.Reason}");
     }
 
-    private bool RequiresConfirmation(string? category, bool crossApp) =>
-        (category != null && _policy.RequiresConfirmation(category)) ||
-        (crossApp && _policy.RequiresConfirmation("cross_app"));
+    private static bool RequiresConfirmation(TaskSession session, string? category, bool crossApp) =>
+        (category != null && session.Policy.RequiresConfirmation(category)) ||
+        (crossApp && session.Policy.RequiresConfirmation("cross_app"));
 
     /// <summary>没有 confirmToken 时签发一次性令牌并返回 needs_confirmation；有令牌时校验并放行。</summary>
-    private object? RequestConfirmation(JsonElement parameters, string method, string summary)
+    private static object? RequestConfirmation(TaskSession session, JsonElement parameters, string method, string summary)
     {
-        var taskId = _taskId ?? throw new DesktopOperationException("invalid_state", "任务上下文已失效");
         var fingerprint = ActionFingerprint.Compute(method, parameters);
         var token = OptionalString(parameters, "confirmToken");
         if (token != null)
         {
-            if (!_confirmations.TryConsume(taskId, token, fingerprint, out var reason))
+            if (!session.Confirmations.TryConsume(session.TaskId, token, fingerprint, out var reason))
             {
-                _auditContext.Decision = "denied:confirmation_invalid";
+                session.AuditContext.Decision = "denied:confirmation_invalid";
                 throw new DesktopOperationException("confirmation_invalid", $"确认令牌无效：{reason}");
             }
-            _auditContext.Decision = "confirm_consumed";
+            session.AuditContext.Decision = "confirm_consumed";
             return null;
         }
-        var issued = _confirmations.Issue(taskId, fingerprint);
-        _auditContext.Decision = "confirm_required";
+        var issued = session.Confirmations.Issue(session.TaskId, fingerprint);
+        session.AuditContext.Decision = "confirm_required";
         return new { status = "needs_confirmation", confirmToken = issued.Token, summary, expiresInMs = issued.ExpiresInMs };
     }
 
-    private void SetActionAudit(string? text, UiaElementInfo? element)
+    private static void SetActionAudit(TaskSession session, string? text, UiaElementInfo? element)
     {
-        _auditContext.Text = text;
-        _auditContext.Target = element == null
-            ? new AuditTarget(_targetProcessName, null, null)
-            : new AuditTarget(_targetProcessName, AuditHash.Sha256(element.Name), element.ControlType);
+        session.AuditContext.Text = text;
+        session.AuditContext.Target = element == null
+            ? new AuditTarget(session.TargetProcessName, null, null)
+            : new AuditTarget(session.TargetProcessName, AuditHash.Sha256(element.Name), element.ControlType);
     }
 
-    private void PrepareAudit()
+    private static void WriteAudit(TaskSession session, string? method, DateTimeOffset started)
     {
-        if (_audit != null) return;
-        _taskId = Guid.NewGuid().ToString("N");
-        _audit = new AuditWriter(AuditWriter.DefaultDirectory, _taskId);
-    }
-
-    private void CloseAudit()
-    {
-        _audit?.Dispose();
-        _audit = null;
-        _taskId = null;
-        _auditContext = new AuditContext();
-    }
-
-    private void WriteAudit(string? method, DateTimeOffset started)
-    {
-        var writer = _audit;
+        var writer = session.Audit;
         if (writer == null || method == null) return;
         try
         {
             writer.Write(new AuditEntry(
-                _taskId ?? string.Empty,
+                session.TaskId,
                 DateTimeOffset.Now,
                 method,
-                _auditContext.Tier,
-                _auditContext.Target,
-                _auditContext.Decision,
-                _auditContext.Redactions.ToArray(),
-                AuditHash.Sha256(_auditContext.Text),
-                _auditContext.Text?.Length ?? 0,
-                _auditContext.Result,
+                session.AuditContext.Tier,
+                session.AuditContext.Target,
+                session.AuditContext.Decision,
+                session.AuditContext.Redactions.ToArray(),
+                AuditHash.Sha256(session.AuditContext.Text),
+                session.AuditContext.Text?.Length ?? 0,
+                session.AuditContext.Result,
                 (long)Math.Max(0, (DateTimeOffset.Now - started).TotalMilliseconds)));
         }
         catch (Exception error)
@@ -1217,41 +1171,105 @@ public sealed class DesktopTaskService
         }
     }
 
-    private async Task ConfirmDanger(string label, string? semantic, string? key)
+    private async Task ConfirmDanger(TaskSession session, string label, string? semantic, string? key)
     {
         if (!RiskAssessment.RequiresConfirmation(label, semantic, key)) return;
-        var approved = _host.ConfirmLocal("Swarm 危险操作确认", $"AI 请求执行：\n\n{label}\n\n这可能关闭窗口、删除、发送、提交或产生其他外部影响。是否只执行这一次？", true);
+        var approved = await _confirmationQueue.AskAsync(
+            _host,
+            "Swarm 危险操作确认",
+            $"AI 请求执行：\n\n{label}\n\n这可能关闭窗口、删除、发送、提交或产生其他外部影响。是否只执行这一次？",
+            true,
+            CancellationToken.None);
         if (!approved) throw new UnauthorizedAccessException("用户拒绝了危险操作");
-        await Task.CompletedTask;
     }
 
-    private async Task CheckGatewayAsync()
+    private async Task CheckSessionsAsync()
     {
-        TargetIdentity? target;
-        int gateway;
-        lock (_sync)
+        foreach (var session in _sessions.All())
         {
-            if (_session == null || _gatewayProcessId == 0) return;
-            target = _target;
-            gateway = _gatewayProcessId;
+            var reason = (string?)null;
+            if (!NativeMethods.IsWindow(session.Target.Handle)) reason = "目标窗口已关闭，任务已停止";
+            else
+            {
+                try
+                {
+                    if (Process.GetProcessById(session.GatewayProcessId).HasExited) reason = "Gateway 已退出，任务已停止";
+                }
+                catch (ArgumentException)
+                {
+                    reason = "Gateway 已退出，任务已停止";
+                }
+            }
+
+            if (reason == null) continue;
+            _host.PostMessage(new { type = "task-status", text = $"{reason}（{session.TargetProcessName}）" });
+            await StopSessionAsync(session);
         }
-        var reason = (string?)null;
-        if (target == null || !NativeMethods.IsWindow(target.Handle)) reason = "目标窗口已关闭，任务已停止";
-        else
+    }
+
+    private async Task StopSessionAsync(TaskSession session)
+    {
+        lock (session)
         {
-            try
-            {
-                if (Process.GetProcessById(gateway).HasExited) reason = "Gateway 已退出，任务已停止";
-            }
-            catch (ArgumentException)
-            {
-                reason = "Gateway 已退出，任务已停止";
-            }
+            if (session.Stopping) return;
+            session.Stopping = true;
         }
 
-        if (reason == null) return;
-        _host.PostMessage(new { type = "task-status", text = reason });
-        await StopLocalAsync();
+        StopMirror(session.Id);
+        try
+        {
+            await session.Operations.StopAsync(TimeSpan.FromMilliseconds(800));
+        }
+        catch
+        {
+            // 收尾阶段的异常不应阻止释放会话。
+        }
+
+        session.Coordinator.Stop();
+        _sessions.Remove(session);
+        UiaWatchdog.Reset(session.Target.ProcessId);
+        session.Audit?.Dispose();
+        session.Audit = null;
+
+        // 覆盖层保留一小段时间展示结束摘要，再隐藏；期间若有新会话开始则不隐藏。
+        // 必须脱离调用链：否则每次 task_end 都要多等 1.2s 才返回。
+        var epoch = Volatile.Read(ref _overlayEpoch);
+        _ = HideOverlayLaterAsync(epoch);
+    }
+
+    private async Task HideOverlayLaterAsync(long epoch)
+    {
+        await Task.Delay(TimeSpan.FromMilliseconds(1200));
+        if (epoch == Volatile.Read(ref _overlayEpoch) && _sessions.Count == 0) _host.HideTaskOverlay();
+    }
+
+    private object Status()
+    {
+        var isolation = IsolationProbe.Detect();
+        return new
+        {
+            sessions = _sessions.All().Select(session => new
+            {
+                sessionId = session.Id,
+                gatewayProcessId = session.GatewayProcessId,
+                processName = session.TargetProcessName,
+                title = session.TargetTitle,
+                handle = session.Target.Handle.ToInt64(),
+                actions = session.ActionCount,
+                inFlight = session.InFlight,
+                manualTakeover = session.ManualTakeover,
+                observedAt = session.ObservedAt == default ? null : session.ObservedAt.ToString("O"),
+                ageMs = (long)Math.Max(0, (DateTimeOffset.Now - session.TaskStartedAt).TotalMilliseconds),
+            }).ToArray(),
+            capacity = _sessions.Capacity,
+            active = _sessions.Count,
+            isolation = new { mode = isolation.Mode, hardAvailable = isolation.HardAvailable, reasons = isolation.Reasons },
+            capture = CaptureService.Stats(),
+            leases = _leases.Snapshot(),
+            uia = UiaWatchdog.Snapshot(),
+            tiers = TierCounters.Snapshot(),
+            mirrorEnabled = _mirrorEnabled,
+        };
     }
 
     private static (List<HspRegion> Regions, List<HspInteractive> Interactives) TranslateUiaToHsp(
@@ -1396,10 +1414,17 @@ public sealed class DesktopTaskService
         return int.TryParse(raw, out var value) ? Math.Clamp(value, min, max) : fallback;
     }
 
+    private static bool ReadFlag(string name)
+    {
+        var raw = Environment.GetEnvironmentVariable(name);
+        return string.Equals(raw, "1", StringComparison.Ordinal) || string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string Success(string id, object result) => JsonSerializer.Serialize(new { id, ok = true, result }, JsonOptions);
     private static string ErrorCode(Exception error) => error switch
     {
         DesktopOperationException desktop => desktop.Code,
+        LeaseTimeoutException => "window_busy",
         UnauthorizedAccessException => "unauthorized",
         TimeoutException => "timeout",
         OperationCanceledException => "stopped",
@@ -1424,19 +1449,6 @@ public sealed class DesktopTaskService
                 message = error.Message,
             },
         }, JsonOptions);
-    }
-
-    private sealed record TargetIdentity(nint Handle, int ProcessId, DateTime StartTimeUtc, string ClassName);
-
-    /// <summary>单次工具调用的审计上下文；请求串行，故可复用实例字段。</summary>
-    private sealed class AuditContext
-    {
-        public string Decision { get; set; } = "allow";
-        public string Result { get; set; } = "ok";
-        public List<AuditRedaction> Redactions { get; } = new();
-        public string? Text { get; set; }
-        public AuditTarget? Target { get; set; }
-        public string? Tier { get; set; }
     }
 
     private readonly record struct ClientGeometry(
@@ -1570,22 +1582,25 @@ public sealed class DesktopTaskService
 
     // ──────────── P1-M Mirror 帧通道 ────────────
 
-    /// <summary>任务授权成功后启动: 周期性抓帧推给 renderer 做人类 mirror 展示.</summary>
-    private void StartMirror()
+    /// <summary>多会话时只镜像最近活跃的一个；未显式开启（SWARM_MIRROR=1）时完全不启动。</summary>
+    private void TouchMirror(TaskSession session)
     {
-        try { _mirrorPump.Start(); }
-        catch { /* 启动失败不影响任务主流程 */ }
+        if (!_mirrorEnabled) return;
+        lock (_mirrorSync)
+        {
+            _mirrorSessionId = session.Id;
+            if (!_mirrorPump.IsEnabled) _mirrorPump.Start();
+        }
     }
 
-    /// <summary>任务停止时关闭 Mirror 帧通道.</summary>
-    private void StopMirror()
+    private void StopMirror(string sessionId)
     {
-        try
+        lock (_mirrorSync)
         {
+            if (_mirrorSessionId != sessionId) return;
+            _mirrorSessionId = null;
             _mirrorPump.Stop();
-            _mirrorGate.Wait(TimeSpan.FromMilliseconds(500));
         }
-        catch { /* 关闭失败静默 */ }
     }
 
     /// <summary>Mirror 帧 Pump: 抓帧 → 编码 → PostMessage 推给 renderer.
@@ -1595,14 +1610,14 @@ public sealed class DesktopTaskService
         if (!_mirrorGate.Wait(0)) return;  // 上一帧 encode 还没结束, 跳过这轮
         try
         {
-            TargetIdentity? identity;
-            lock (_sync)
+            TaskSession? session;
+            lock (_mirrorSync)
             {
-                if (_stopping || _target == null) return;
-                identity = _target;
+                session = _mirrorSessionId == null ? null : _sessions.ById(_mirrorSessionId);
             }
+            if (session == null || session.Stopping) return;
 
-            var capture = await CaptureService.CaptureAsync(identity.Handle);
+            var capture = await CaptureService.CaptureAsync(session.Target.Handle);
             if (capture.Frame == null) return;
             if (capture.Occluded) return;  // 遮挡帧跳过, 人类 mirror 应展示目标窗口内容
 
@@ -1613,6 +1628,7 @@ public sealed class DesktopTaskService
             _host.PostMessage(new
             {
                 type = "frame",
+                sessionId = session.Id,
                 data = base64,
                 mimeType = "image/png",
                 width = frame.Width,

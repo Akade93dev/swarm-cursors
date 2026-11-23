@@ -132,7 +132,7 @@ public static class SmokeAuthorization {
     $initialized = Rpc 'initialize' @{ protocolVersion = '2024-11-05'; capabilities = @{}; clientInfo = @{ name = 'cold-smoke'; version = '1.0' } }
     Assert 'initialize' ($null -ne $initialized.result.serverInfo) ($initialized.result.serverInfo | ConvertTo-Json -Compress)
     $listed = Rpc 'tools/list' @{}
-    Assert 'tools/list' (@($listed.result.tools).Count -eq 9) "tools=$(@($listed.result.tools).Count)"
+    Assert 'tools/list' (@($listed.result.tools).Count -eq 10) "tools=$(@($listed.result.tools).Count)"
 
     $begin = Tool 'task_begin' @{ targetTitle = 'swarm pixel harness' }
     $token = $begin.structuredContent.token

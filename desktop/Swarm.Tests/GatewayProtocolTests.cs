@@ -87,7 +87,7 @@ public class GatewayProtocolTests
 
         using var document = JsonDocument.Parse(response!);
         var tools = document.RootElement.GetProperty("result").GetProperty("tools");
-        Assert.Equal(new[] { "task_begin", "observe", "click", "type_text", "press_key", "scroll", "focus", "task_end", "task_stop" },
+        Assert.Equal(new[] { "task_begin", "observe", "click", "type_text", "press_key", "scroll", "focus", "task_end", "task_stop", "desktop_status" },
             tools.EnumerateArray().Select(tool => tool.GetProperty("name").GetString()).ToArray());
         Assert.Contains("local user authorization", tools[0].GetProperty("description").GetString(), StringComparison.OrdinalIgnoreCase);
         Assert.Contains("window-client CSS", tools[1].GetProperty("description").GetString(), StringComparison.OrdinalIgnoreCase);
@@ -115,6 +115,7 @@ public class GatewayProtocolTests
             ["focus"] = (false, false, true, true),
             ["task_end"] = (false, false, true, false),
             ["task_stop"] = (false, false, true, false),
+            ["desktop_status"] = (true, false, true, false),
         };
 
         Assert.Equal(expected.Count, tools.GetArrayLength());
@@ -134,6 +135,7 @@ public class GatewayProtocolTests
             var properties = schema.GetProperty("properties");
             var isEnd = name is "task_end" or "task_stop";
             var isAction = name is "click" or "type_text" or "press_key" or "scroll" or "focus";
+            var isStatus = name == "desktop_status";
             if (isEnd)
             {
                 Assert.True(properties.TryGetProperty("ok", out _));
@@ -143,6 +145,12 @@ public class GatewayProtocolTests
                 Assert.True(properties.TryGetProperty("executed", out _));
                 Assert.True(properties.TryGetProperty("tier", out _));
                 Assert.True(properties.TryGetProperty("verified", out _));
+            }
+            else if (isStatus)
+            {
+                Assert.True(properties.TryGetProperty("sessions", out _));
+                Assert.True(properties.TryGetProperty("active", out _));
+                Assert.True(properties.TryGetProperty("capacity", out _));
             }
             else
             {
