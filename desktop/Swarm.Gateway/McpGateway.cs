@@ -458,6 +458,14 @@ public sealed class McpGateway
                     blockedResult = true,
                     inputRequiredResult = true,
                 },
+                // P1-W: Word provider 三层能力 (诚实上报, 不假装支持).
+                // T1 CustomPatterns 需要 Office ≥ 2112 + CallExtension Bridge; T2 TextPattern 标准通道已就绪.
+                wordProvider = new
+                {
+                    t1CustomPatterns = false,
+                    t2TextPattern = true,
+                    t3ComReadonly = false,
+                },
             },
             serverInfo = new { name = "swarm-desktop", version = "1.0.0", protocolVersions = SupportedProtocolVersions },
             instructions = "Call task_begin first to obtain local user authorization. Coordinates are window-client CSS pixels returned by observe; elementId takes precedence. Screenshots are returned on task_begin and on explicit observe requests. The desktop never steals foreground: if an action returns needs_foreground, call focus first. Esc stops when the target is focused; Ctrl+Alt+Shift+Esc always stops.",
@@ -482,6 +490,13 @@ public sealed class McpGateway
                 redactions = new[] { "password", "credential", "email", "id", "bank", "phone" },
                 blockedResult = true,
                 inputRequiredResult = true,
+            },
+            // P1-W: Word provider 三层能力 (诚实上报).
+            wordProvider = new
+            {
+                t1CustomPatterns = false,
+                t2TextPattern = true,
+                t3ComReadonly = false,
             },
         },
         serverInfo = new { name = "swarm-desktop", version = "1.0.0" },

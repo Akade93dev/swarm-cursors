@@ -40,7 +40,12 @@
                                                                                                                             ],
                                                                                                              "blockedResult":  true,
                                                                                                              "inputRequiredResult":  true
-                                                                                                         }
+                                                                                                         },
+                                                                                          "wordProvider":  {
+                                                                                                               "t1CustomPatterns":  false,
+                                                                                                               "t2TextPattern":  true,
+                                                                                                               "t3ComReadonly":  false
+                                                                                                           }
                                                                                       },
                                                                      "serverInfo":  {
                                                                                         "name":  "swarm-desktop",
@@ -96,7 +101,12 @@
                                                                                                                             ],
                                                                                                              "blockedResult":  true,
                                                                                                              "inputRequiredResult":  true
-                                                                                                         }
+                                                                                                         },
+                                                                                          "wordProvider":  {
+                                                                                                               "t1CustomPatterns":  false,
+                                                                                                               "t2TextPattern":  true,
+                                                                                                               "t3ComReadonly":  false
+                                                                                                           }
                                                                                       },
                                                                      "serverInfo":  {
                                                                                         "name":  "swarm-desktop",

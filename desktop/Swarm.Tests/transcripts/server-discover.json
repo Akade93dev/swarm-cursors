@@ -29,7 +29,12 @@
                                                                                                          },
                                                                                           "tools":  {
                                                                                                         "listChanged":  false
-                                                                                                    }
+                                                                                                    },
+                                                                                          "wordProvider":  {
+                                                                                                               "t1CustomPatterns":  false,
+                                                                                                               "t2TextPattern":  true,
+                                                                                                               "t3ComReadonly":  false
+                                                                                                           }
                                                                                       },
                                                                      "defaultProtocolVersion":  "2024-11-05",
                                                                      "endpoints":  [
